@@ -1218,6 +1218,31 @@ pub async fn get_download_uri(id: String) -> napi::Result<String> {
     }
 }
 
+/// Cancel an in-flight upload session so the server clears its placeholder.
+/// V4: calls DELETE /file/upload. V3 has no public delete endpoint — the
+/// session expires server-side on its own, so we simply succeed quietly.
+#[napi]
+pub async fn delete_upload_session(path: String, session_id: String) -> napi::Result<()> {
+    let api = get_client()?;
+    if api.inner().as_v3().is_some() {
+        return Ok(());
+    }
+    run_api_with_v4_refresh(|api| {
+        let path = path.clone();
+        let session_id = session_id.clone();
+        async move {
+            let v4 = api.inner().as_v4().ok_or_else(|| {
+                ApiError::UnsupportedFeature(
+                    "delete_upload_session".to_string(),
+                    "non-v4".to_string(),
+                )
+            })?;
+            v4.delete_upload_session(&path, &session_id).await
+        }
+    })
+    .await
+}
+
 /// Returns upload session JSON: { sessionId, chunkSize, expires }
 #[napi]
 pub async fn get_upload_uri(
