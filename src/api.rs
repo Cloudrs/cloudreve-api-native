@@ -1,6 +1,7 @@
 use napi::{Env, JsFunction, JsObject, threadsafe_function::{ErrorStrategy, ThreadsafeFunction, ThreadsafeFunctionCallMode}};
 use napi_derive::napi;
 use std::{fs, future::Future, io::{Read, Seek, SeekFrom}, sync::{Mutex, OnceLock}};
+use base64::Engine;
 use cloudreve_api::{
     ApiVersion, CloudreveAPI, Error as ApiError, LoginResponse,
     api::v3::models::{
@@ -580,6 +581,34 @@ pub async fn init(base_url: String) -> napi::Result<String> {
     let version = api.api_version().as_str().to_string();
     set_client(api);
     Ok(version)
+}
+
+/// Return [apiVersion, serverVersion] for the current connected server.
+/// apiVersion is "v3" or "v4"; serverVersion comes from /site/ping and may be
+/// "unknown" if the server doesn't expose it (or the call times out). The
+/// ping is capped at 5s so the About page never stalls on a flaky server.
+#[napi]
+pub async fn get_api_version_info() -> napi::Result<Vec<String>> {
+    let api = get_client()?;
+    let api_version = api.api_version().as_str().to_string();
+    let server_version = if let Some(v3) = api.inner().as_v3() {
+        ping_with_timeout(v3.ping()).await
+    } else if let Some(v4) = api.inner().as_v4() {
+        ping_with_timeout(v4.ping()).await
+    } else {
+        "unknown".to_string()
+    };
+    Ok(vec![api_version, server_version])
+}
+
+async fn ping_with_timeout<F>(fut: F) -> String
+where
+    F: std::future::Future<Output = Result<String, cloudreve_api::Error>>,
+{
+    match tokio::time::timeout(std::time::Duration::from_secs(5), fut).await {
+        Ok(Ok(version)) => version,
+        _ => "unknown".to_string(),
+    }
 }
 
 /// Restore a saved session without re-authenticating.
@@ -1691,6 +1720,7 @@ pub async fn aria2_downloading() -> napi::Result<String> {
             .list_downloading()
             .await
             .map_err(|e| napi::Error::from_reason(e.to_string()))?;
+        log::info!("v3 aria2_downloading tasks={}", tasks.len());
         serde_json::to_string(&tasks).map_err(|e| napi::Error::from_reason(e.to_string()))
     } else {
         let result = v4_aria2_downloading(&api).await;
@@ -1711,12 +1741,31 @@ pub async fn aria2_downloading() -> napi::Result<String> {
 async fn v4_aria2_finished(api: &CloudreveAPI) -> napi::Result<String> {
     let v4 = api.inner().as_v4()
         .ok_or_else(|| napi::Error::from_reason("not a v4 client"))?;
+        // Probe raw JSON first so we can log statuses we may have missed before the
+        // strongly-typed model filters anything out.
+        let raw: V4ApiResponse<serde_json::Value> = v4
+            .get("/workflow?page_size=100&category=downloaded")
+            .await
+            .map_err(|e| napi::Error::from_reason(e.to_string()))?;
+        let statuses: Vec<String> = raw.data.as_ref()
+            .and_then(|d| d.get("tasks").and_then(|t| t.as_array()))
+            .map(|arr| arr.iter().filter_map(|t| {
+                t.get("status").and_then(|s| s.as_str()).map(|s| s.to_string())
+            }).collect())
+            .unwrap_or_default();
+        log::info!(
+            "v4 aria2_finished(category=downloaded) code={} msg={} raw_tasks={} statuses={:?}",
+            raw.code, raw.msg,
+            raw.data.as_ref().and_then(|d| d.get("tasks").and_then(|t| t.as_array())).map(|a| a.len()).unwrap_or(0),
+            statuses
+        );
         let resp: V4ApiResponse<TaskListResponse> = v4.get("/workflow?page_size=100&category=downloaded")
             .await
             .map_err(|e| napi::Error::from_reason(e.to_string()))?;
         let task_list = resp.data.ok_or_else(|| napi::Error::from_reason(resp.msg.clone()))?;
         let tasks: Vec<serde_json::Value> = task_list.tasks.iter()
-            .filter(|t| matches!(t.status, TaskStatus::Completed | TaskStatus::Error | TaskStatus::Canceled))
+            .filter(|t| matches!(t.status,
+                TaskStatus::Completed | TaskStatus::Error | TaskStatus::Canceled))
             .map(|t| {
                 let props = t.summary.as_ref().map(|s| &s.props);
                 let dl = props.and_then(|p| p.get("download"));
@@ -1785,13 +1834,24 @@ async fn v4_aria2_finished(api: &CloudreveAPI) -> napi::Result<String> {
 }
 
 #[napi]
-pub async fn aria2_finished(_page: i32) -> napi::Result<String> {
+pub async fn aria2_finished(page: i32) -> napi::Result<String> {
     let api = get_client()?;
     if let Some(v3) = api.inner().as_v3() {
-        let tasks = v3
+        // Cloudreve v3 returns the full finished list in a single response (no pagination
+        // wrapper); keep the page arg for ArkTS compatibility and short-circuit after the
+        // first page so LazyForEach's `onReachEnd` stops issuing requests.
+        if page.max(1) > 1 {
+            return Ok("[]".to_string());
+        }
+        let mut tasks = v3
             .list_finished()
             .await
             .map_err(|e| napi::Error::from_reason(e.to_string()))?;
+        // Cloudreve v3 returns these chronologically ascending — the user's just-created
+        // (often failed-fast) task ends up at the bottom of a long list, which reads as
+        // "missing" in the UI. Surface newest first instead.
+        tasks.sort_by(|a, b| b.update.cmp(&a.update));
+        log::info!("v3 aria2_finished tasks={}", tasks.len());
         serde_json::to_string(&tasks).map_err(|e| napi::Error::from_reason(e.to_string()))
     } else {
         let result = v4_aria2_finished(&api).await;
@@ -1883,15 +1943,11 @@ pub async fn aria2_delete_task(gid: String) -> napi::Result<()> {
 pub async fn get_user_tasks(page: i32) -> napi::Result<String> {
     let api = get_client()?;
     if let Some(v3) = api.inner().as_v3() {
-        use cloudreve_api::api::v3::models::ApiResponse;
-        use serde_json::Value;
-        let url = format!("/user/setting/tasks?page={}", page);
-        let resp: ApiResponse<Value> = v3
-            .get(&url)
+        let list = v3
+            .get_task_queue(page)
             .await
             .map_err(|e| napi::Error::from_reason(e.to_string()))?;
-        let data = resp.data.unwrap_or(Value::Null);
-        serde_json::to_string(&data).map_err(|e| napi::Error::from_reason(e.to_string()))
+        serde_json::to_string(&list).map_err(|e| napi::Error::from_reason(e.to_string()))
     } else {
         let v4 = api.inner().as_v4()
             .ok_or_else(|| napi::Error::from_reason("not a v4 client"))?;
@@ -1937,8 +1993,46 @@ struct V4ThumbData {
 pub async fn get_thumb(id: String) -> napi::Result<String> {
     let api = get_client()?;
     if let Some(v3) = api.inner().as_v3() {
-        // V3: return the thumb URL; caller adds cookie auth via system HTTP if possible
-        Ok(format!("{}/api/v3/file/thumb/{}", v3.base_url, id))
+        // V3 thumb endpoint requires session cookie auth; either returns raw image bytes
+        // (local storage) or redirects to a signed CDN URL (cloud storage). Follow redirects
+        // and return a `data:` URL so the ArkUI Image component can render without extra auth.
+        let url = format!("{}/api/v3/file/thumb/{}", v3.base_url.trim_end_matches('/'), id);
+        let cookie = api.get_session_cookie().unwrap_or_default();
+        let cookie_header = if cookie.starts_with("cloudreve-session=") {
+            cookie
+        } else {
+            format!("cloudreve-session={}", cookie)
+        };
+        let client = reqwest::Client::builder()
+            .redirect(reqwest::redirect::Policy::limited(10))
+            .build()
+            .map_err(|e| napi::Error::from_reason(e.to_string()))?;
+        let response = client
+            .get(&url)
+            .header(reqwest::header::COOKIE, cookie_header)
+            .send()
+            .await
+            .map_err(|e| napi::Error::from_reason(e.to_string()))?;
+        let status = response.status();
+        if !status.is_success() {
+            return Err(napi::Error::from_reason(format!(
+                "thumb request failed: {}",
+                status
+            )));
+        }
+        let mime = response
+            .headers()
+            .get(reqwest::header::CONTENT_TYPE)
+            .and_then(|v| v.to_str().ok())
+            .map(|v| v.split(';').next().unwrap_or(v).trim().to_string())
+            .filter(|v| v.starts_with("image/"))
+            .unwrap_or_else(|| "image/jpeg".to_string());
+        let bytes = response
+            .bytes()
+            .await
+            .map_err(|e| napi::Error::from_reason(e.to_string()))?;
+        let encoded = base64::engine::general_purpose::STANDARD.encode(&bytes);
+        Ok(format!("data:{};base64,{}", mime, encoded))
     } else {
         let v4 = api.inner().as_v4()
             .ok_or_else(|| napi::Error::from_reason("not a v4 client"))?;
@@ -1956,41 +2050,58 @@ pub async fn get_thumb(id: String) -> napi::Result<String> {
 // ---- V4 Exclusive: Share Links ----
 
 /// Create a share link for a file or folder. Returns the share URL string.
+/// Retries once after a token refresh when the access token has expired.
 #[napi]
 pub async fn create_share_link(path: String, expire_days: i32, password: String) -> napi::Result<String> {
-    let api = get_client()?;
-    let v4 = api.inner().as_v4()
-        .ok_or_else(|| napi::Error::from_reason("share links require V4"))?;
-    let permissions = PermissionSetting {
-        user_explicit: serde_json::json!({}),
-        group_explicit: serde_json::json!({}),
-        same_group: "read".to_string(),
-        other: "read".to_string(),
-        anonymous: "read".to_string(),
-        everyone: "read".to_string(),
-    };
-    let req = CreateShareLinkRequest {
-        permissions,
-        uri: path,
-        is_private: if password.is_empty() { None } else { Some(true) },
-        share_view: None,
-        expire: if expire_days > 0 { Some(expire_days as u32 * 24 * 60 * 60) } else { None },
-        price: None,
-        password: if password.is_empty() { None } else { Some(password) },
-        show_readme: None,
-    };
-    v4.create_share_link(&req)
-        .await
-        .map_err(|e| napi::Error::from_reason(e.to_string()))
+    run_api_with_v4_refresh(move |api| {
+        let path = path.clone();
+        let password = password.clone();
+        async move {
+            let v4 = api.inner().as_v4()
+                .ok_or_else(|| ApiError::InvalidResponse("share links require V4".to_string()))?;
+            let permissions = PermissionSetting {
+                user_explicit: serde_json::json!({}),
+                group_explicit: serde_json::json!({}),
+                same_group: "read".to_string(),
+                other: "read".to_string(),
+                anonymous: "read".to_string(),
+                everyone: "read".to_string(),
+            };
+            let req = CreateShareLinkRequest {
+                permissions,
+                uri: path,
+                is_private: if password.is_empty() { None } else { Some(true) },
+                share_view: None,
+                expire: if expire_days > 0 { Some(expire_days as u32 * 24 * 60 * 60) } else { None },
+                price: None,
+                password: if password.is_empty() { None } else { Some(password) },
+                show_readme: None,
+            };
+            v4.create_share_link(&req).await
+        }
+    }).await
 }
 
 /// List current user's share links. Returns JSON array.
+/// Works for both v3 and v4 servers; v3 shares get mapped to the v4-shaped fields
+/// the ETS layer expects (id/name/source_type/source/source_uri/...).
+/// V4 retries once after a token refresh when the access token has expired.
 #[napi]
 pub async fn list_share_links() -> napi::Result<String> {
     let api = get_client()?;
-    let v4 = api.inner().as_v4()
-        .ok_or_else(|| napi::Error::from_reason("share links require V4"))?;
 
+    if let Some(v3) = api.inner().as_v3() {
+        return list_share_links_v3(v3).await;
+    }
+
+    run_api_with_v4_refresh(|api| async move {
+        let v4 = api.inner().as_v4()
+            .ok_or_else(|| ApiError::InvalidResponse("share links require V3 or V4".to_string()))?;
+        list_share_links_v4(v4).await
+    }).await
+}
+
+async fn list_share_links_v4(v4: &ApiV4Client) -> Result<String, ApiError> {
     let mut all_shares: Vec<serde_json::Value> = Vec::new();
     let mut next_page_token: Option<String> = None;
     let mut page_count = 0;
@@ -2003,13 +2114,10 @@ pub async fn list_share_links() -> napi::Result<String> {
             endpoint.push_str(&encode_query_component(token));
         }
 
-        let resp: V4ApiResponse<serde_json::Value> = v4
-            .get(&endpoint)
-            .await
-            .map_err(|e| napi::Error::from_reason(e.to_string()))?;
+        let resp: V4ApiResponse<serde_json::Value> = v4.get(&endpoint).await?;
         let data = resp
             .data
-            .ok_or_else(|| napi::Error::from_reason(resp.msg))?;
+            .ok_or_else(|| ApiError::InvalidResponse(resp.msg))?;
 
         let mut shares = data
             .get("shares")
@@ -2030,18 +2138,113 @@ pub async fn list_share_links() -> napi::Result<String> {
         next_page_token = next;
     }
 
-    serde_json::to_string(&all_shares).map_err(|e| napi::Error::from_reason(e.to_string()))
+    serde_json::to_string(&all_shares).map_err(|e| ApiError::InvalidResponse(e.to_string()))
+}
+
+async fn list_share_links_v3(v3: &cloudreve_api::api::v3::ApiV3Client) -> napi::Result<String> {
+    let base_url = v3.base_url.trim_end_matches('/').to_string();
+    let mut out: Vec<serde_json::Value> = Vec::new();
+    let mut page: u32 = 1;
+    loop {
+        let endpoint = format!(
+            "/share?page={}&order_by=created_at&order=DESC",
+            page
+        );
+        let resp: serde_json::Value = match v3.get(&endpoint).await {
+            Ok(value) => value,
+            Err(err) => return Err(napi::Error::from_reason(err.to_string())),
+        };
+        let data = resp.get("data").cloned().unwrap_or(serde_json::Value::Null);
+        let items = data
+            .get("items")
+            .and_then(|value| value.as_array())
+            .cloned()
+            .unwrap_or_default();
+        if items.is_empty() {
+            break;
+        }
+        for item in items {
+            out.push(map_v3_share_to_unified(&item, &base_url));
+        }
+        page += 1;
+        if page > 100 {
+            break;
+        }
+    }
+    serde_json::to_string(&out).map_err(|e| napi::Error::from_reason(e.to_string()))
+}
+
+fn map_v3_share_to_unified(item: &serde_json::Value, base_url: &str) -> serde_json::Value {
+    let key = item.get("key").and_then(|v| v.as_str()).unwrap_or("").to_string();
+    let is_dir = item.get("is_dir").and_then(|v| v.as_bool()).unwrap_or(false);
+    let password = item.get("password").and_then(|v| v.as_str()).unwrap_or("").to_string();
+    let source_name = item
+        .get("source")
+        .and_then(|v| v.get("name"))
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
+    let expire_seconds = item.get("expire").and_then(|v| v.as_i64()).unwrap_or(-1);
+    let downloads = item.get("downloads").and_then(|v| v.as_i64()).unwrap_or(0);
+    let views = item.get("views").and_then(|v| v.as_i64()).unwrap_or(0);
+    let create_date = item.get("create_date").and_then(|v| v.as_str()).unwrap_or("").to_string();
+
+    let url = if password.is_empty() {
+        format!("{}/s/{}", base_url, key)
+    } else {
+        format!("{}/s/{}/{}", base_url, key, password)
+    };
+
+    let expired = expire_seconds == 0;
+
+    let mut obj = serde_json::Map::new();
+    obj.insert("id".into(), serde_json::Value::String(key));
+    obj.insert("name".into(), serde_json::Value::String(source_name.clone()));
+    obj.insert("url".into(), serde_json::Value::String(url));
+    obj.insert(
+        "source_type".into(),
+        serde_json::Value::Number(if is_dir { 1.into() } else { 0.into() }),
+    );
+    obj.insert("source_uri".into(), serde_json::Value::String(String::new()));
+    obj.insert(
+        "source".into(),
+        serde_json::json!({ "name": source_name }),
+    );
+    obj.insert("password".into(), serde_json::Value::String(password.clone()));
+    obj.insert(
+        "password_protected".into(),
+        serde_json::Value::Bool(!password.is_empty()),
+    );
+    obj.insert("expired".into(), serde_json::Value::Bool(expired));
+    obj.insert("created_at".into(), serde_json::Value::String(create_date));
+    obj.insert(
+        "downloaded".into(),
+        serde_json::Value::Number(downloads.into()),
+    );
+    obj.insert("visited".into(), serde_json::Value::Number(views.into()));
+    obj.insert(
+        "expires".into(),
+        if expire_seconds > 0 {
+            serde_json::Value::String(format!("{}", expire_seconds))
+        } else {
+            serde_json::Value::Null
+        },
+    );
+    serde_json::Value::Object(obj)
 }
 
 /// Delete a share link by ID.
+/// Retries once after a token refresh when the access token has expired.
 #[napi]
 pub async fn delete_share_link(share_id: String) -> napi::Result<()> {
-    let api = get_client()?;
-    let v4 = api.inner().as_v4()
-        .ok_or_else(|| napi::Error::from_reason("share links require V4"))?;
-    v4.delete_share_link(&share_id)
-        .await
-        .map_err(|e| napi::Error::from_reason(e.to_string()))
+    run_api_with_v4_refresh(move |api| {
+        let share_id = share_id.clone();
+        async move {
+            let v4 = api.inner().as_v4()
+                .ok_or_else(|| ApiError::InvalidResponse("share links require V4".to_string()))?;
+            v4.delete_share_link(&share_id).await
+        }
+    }).await
 }
 
 // ---- V4 Exclusive: Archive Operations ----
