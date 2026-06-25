@@ -1393,6 +1393,7 @@ pub async fn upload_local_file(
     local_path: String,
     remote_path: String,
     overwrite: bool,
+    last_modified_ms: Option<i64>,
 ) -> napi::Result<()> {
     let content = fs::read(&local_path)
         .map_err(|e| napi::Error::from_reason(format!("read local file failed: {}", e)))?;
@@ -1405,7 +1406,9 @@ pub async fn upload_local_file(
     if let Some(policy_id) = &policy_id {
         set_v4_policy_id(Some(policy_id.clone()));
     }
-    api.upload_file(&remote_path, content, policy_id.as_deref(), overwrite)
+    // 仅在正数时透传：0/负数视为未提供，服务端按当前时间打戳
+    let last_modified_ms = last_modified_ms.and_then(|v| if v > 0 { Some(v as u64) } else { None });
+    api.upload_file(&remote_path, content, policy_id.as_deref(), overwrite, last_modified_ms)
         .await
         .map_err(|e| napi::Error::from_reason(e.to_string()))
 }
