@@ -22,7 +22,7 @@ use cloudreve_api::{
         },
         uri::path_to_uri as v4_path_to_uri,
     },
-    cloudreve_api::{SiteConfigValue, FileList},
+    cloudreve_api::{SiteConfigValue, FileList, FileListAll},
 };
 use serde::{Deserialize, Serialize};
 use serde_json::json;
@@ -877,11 +877,11 @@ pub async fn get_user_avatar(user_id: String) -> napi::Result<Vec<u8>> {
 pub async fn get_directory(path: String) -> napi::Result<String> {
     let files = run_api_with_v4_refresh(|api| {
         let path = path.clone();
-        async move { api.list_files(&path, None, None).await }
+        async move { api.list_files_all(&path, None).await }
     }).await?;
     match files {
-        FileList::V3(dir) => serde_json::to_string(&dir),
-        FileList::V4(v4) => {
+        FileListAll::V3(dir) => serde_json::to_string(&dir),
+        FileListAll::V4(v4) => {
             // Cache the policy id for use in upload
             if let Some(policy) = &v4.storage_policy {
                 set_v4_policy_id(Some(policy.id.clone()));
