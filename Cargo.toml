@@ -10,7 +10,7 @@ name = "cloudreve"
 [dependencies]
 napi = { version = "2", default-features = false, features = ["napi4", "tokio_rt"] }
 napi-derive = "2"
-cloudreve-api = "0.6.1"
+cloudreve-api = "0.6.2"
 reqwest = { version = "0.13", default-features = false, features = ["json", "rustls-no-provider", "stream"] }
 tokio = { version = "1", features = ["rt", "rt-multi-thread", "fs", "io-util"] }
 serde = { version = "1", features = ["derive"] }
