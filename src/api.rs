@@ -19,6 +19,7 @@ use cloudreve_api::{
             CreateShareLinkRequest, PermissionSetting,
             CreateArchiveRequest, ExtractArchiveRequest,
             RefreshTokenRequest,
+            MoveFileRequest as V4MoveFileRequest,
         },
         uri::path_to_uri as v4_path_to_uri,
     },
@@ -1041,18 +1042,34 @@ async fn v4_create_object(v4: &ApiV4Client, path: &str, object_type: &str) -> Re
     Ok(())
 }
 
-async fn v4_do_move(api: &CloudreveAPI, items: &[String], dirs: &[String], dst: &str) -> Result<(), ApiError> {
-    for path in items.iter().chain(dirs.iter()) {
-        api.move_file(path, dst).await?;
+// dst is always a destination *directory*; call the raw /file/move endpoint directly.
+// The crate's high-level move_file/copy_file treat a dst whose parent equals the
+// source parent as a rename, which breaks moving into a sibling folder.
+async fn v4_do_move_or_copy(api: &CloudreveAPI, items: &[String], dirs: &[String], dst: &str, is_copy: bool) -> Result<(), ApiError> {
+    let v4 = api.inner().as_v4().ok_or_else(|| {
+        ApiError::UnsupportedFeature("move/copy".to_string(), "non-v4".to_string())
+    })?;
+    let uris: Vec<String> = items.iter().chain(dirs.iter())
+        .map(|p| v4_path_to_uri(p))
+        .collect();
+    if uris.is_empty() {
+        return Ok(());
     }
-    Ok(())
+    let dst_uri = v4_path_to_uri(dst);
+    let request = V4MoveFileRequest {
+        uris: uris.iter().map(String::as_str).collect(),
+        dst: &dst_uri,
+        copy: if is_copy { Some(true) } else { None },
+    };
+    v4.move_file(&request).await
+}
+
+async fn v4_do_move(api: &CloudreveAPI, items: &[String], dirs: &[String], dst: &str) -> Result<(), ApiError> {
+    v4_do_move_or_copy(api, items, dirs, dst, false).await
 }
 
 async fn v4_do_copy(api: &CloudreveAPI, items: &[String], dirs: &[String], dst: &str) -> Result<(), ApiError> {
-    for path in items.iter().chain(dirs.iter()) {
-        api.copy_file(path, dst).await?;
-    }
-    Ok(())
+    v4_do_move_or_copy(api, items, dirs, dst, true).await
 }
 
 #[napi]
