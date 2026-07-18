@@ -161,9 +161,34 @@ fn v4_uri_to_unix(uri: &str) -> String {
     }
 }
 
-fn is_image_file(name: &str) -> bool {
+fn supports_thumbnail(name: &str) -> bool {
     let ext = name.rsplit('.').next().unwrap_or("").to_lowercase();
-    matches!(ext.as_str(), "jpg" | "jpeg" | "png" | "gif" | "webp" | "bmp" | "heic" | "heif" | "tiff" | "tif" | "avif")
+    matches!(
+        ext.as_str(),
+        "jpg"
+            | "jpeg"
+            | "png"
+            | "gif"
+            | "webp"
+            | "bmp"
+            | "heic"
+            | "heif"
+            | "tiff"
+            | "tif"
+            | "avif"
+            | "mp4"
+            | "mkv"
+            | "mov"
+            | "wmv"
+            | "flv"
+            | "avi"
+            | "rmvb"
+            | "mpg"
+            | "mpeg"
+            | "m4v"
+            | "webm"
+            | "3gp"
+    )
 }
 
 fn encode_query_component(value: &str) -> String {
@@ -896,7 +921,12 @@ pub async fn get_directory(path: String) -> napi::Result<String> {
                     id: unix_path.clone(),   // full path — used by delete/move/copy/rename/download
                     name: f.name.clone(),
                     path: parent_path,       // parent dir — matches V3 convention
-                    thumb: !is_dir && is_image_file(&f.name),
+                    // Cloudreve v4 can generate thumbnails for both images and
+                    // videos. The API does not expose a per-file availability
+                    // flag, so mark supported media as candidates and let the
+                    // thumbnail request fall back to the file-type icon when the
+                    // server cannot generate one.
+                    thumb: !is_dir && supports_thumbnail(&f.name),
                     size: f.size,
                     object_type: if is_dir { "dir" } else { "file" },
                     date: f.updated_at.clone(),
