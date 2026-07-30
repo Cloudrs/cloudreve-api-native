@@ -1325,7 +1325,10 @@ pub async fn get_upload_uri(
     path: String,
     size: u32,
     name: String,
-    last_modified: u32,
+    // JavaScript Date milliseconds are ~1.7e12 and cannot fit in u32.
+    // Using u32 truncated the high bits at the N-API boundary, turning
+    // 2026 timestamps into dates around January 1970 on the server.
+    last_modified: i64,
     mime_type: String,
     chunk_size: u32,
 ) -> napi::Result<String> {
@@ -1345,7 +1348,8 @@ pub async fn get_upload_uri(
             name: &name,
             policy_id: &dir.policy.id,
             size: size as i64,
-            last_modified: last_modified as i64,
+            // Cloudreve V3 expects Unix seconds; V4 expects Unix milliseconds.
+            last_modified: if last_modified > 0 { last_modified / 1000 } else { 0 },
             mime_type: &mime_type,
         };
         let session = v3
