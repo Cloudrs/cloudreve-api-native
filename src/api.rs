@@ -875,9 +875,32 @@ pub async fn get_user_setting() -> napi::Result<String> {
     }
 }
 
+/// 头像同样要能在 access token 过期后自愈：它不走 CloudreveAPI 的封装
+/// （要的是原始字节，不是 JSON），所以 run_api_with_v4_refresh 套不上，
+/// 这里照 get_download_uri 的写法手动刷新重试一次。
+/// 返回 Uint8Array 而不是 Vec<u8>：napi-rs v2 把 Vec<u8> 映射成 JS 的普通数组，
+/// ArkTS 侧 image.createImageSource 拿到它会直接返回 undefined。
 #[napi]
-pub async fn get_user_avatar(user_id: String) -> napi::Result<Vec<u8>> {
+pub async fn get_user_avatar(user_id: String) -> napi::Result<napi::bindgen_prelude::Uint8Array> {
     let api = get_client()?;
+    let result = fetch_user_avatar(&api, &user_id).await;
+    match result {
+        Err(_) if api.inner().is_v4() => {
+            if do_v4_refresh().await.is_ok() {
+                let api2 = get_client()?;
+                fetch_user_avatar(&api2, &user_id).await
+            } else {
+                result
+            }
+        }
+        other => other,
+    }
+}
+
+async fn fetch_user_avatar(
+    api: &CloudreveAPI,
+    user_id: &str,
+) -> napi::Result<napi::bindgen_prelude::Uint8Array> {
     let client = reqwest::Client::builder()
         .redirect(reqwest::redirect::Policy::limited(10))
         .build()
@@ -927,7 +950,7 @@ pub async fn get_user_avatar(user_id: String) -> napi::Result<Vec<u8>> {
         .bytes()
         .await
         .map_err(|e| napi::Error::from_reason(e.to_string()))?;
-    Ok(bytes.to_vec())
+    Ok(napi::bindgen_prelude::Uint8Array::new(bytes.to_vec()))
 }
 
 // ---- Directory / Files ----
