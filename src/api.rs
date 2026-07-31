@@ -1157,6 +1157,293 @@ pub async fn delete_objects(items: Vec<String>, dirs: Vec<String>) -> napi::Resu
     }
 }
 
+// ---- 锁感知删除 / 解锁 / metadata 点查 / 搜索 ----
+//
+// 这四件事以前留在 ArkTS 侧裸发 HTTP，因为 crate 的封装满足不了：
+// delete_file 只返回 Result<(), Error>，而 Error::Api 只带 code+message，
+// 40073 响应体里的锁冲突列表（data）在那一层就丢了，拿不到就没法"解除占用"。
+// 结果是这条链路绕开了 run_api_with_v4_refresh，access token 一过期就永久失败。
+// 现在统一挪回 native，全部套刷新重试。
+
+/// V4 在登录态失效时的表现并不一致：GET /file/info 这类返回 code=401，
+/// 而 DELETE /api/v4/file 会先去解析 uri，失败后返回 40081 + "Login required"。
+/// 两种都得认成失效，否则 run_api_with_v4_refresh 不会刷新 token。
+fn v4_auth_expired(code: i32, msg: &str) -> bool {
+    code == 401 || msg.to_ascii_lowercase().contains("login required")
+}
+
+fn v4_client_of<'a>(api: &'a CloudreveAPI, feature: &str) -> Result<&'a ApiV4Client, ApiError> {
+    api.inner()
+        .as_v4()
+        .ok_or_else(|| ApiError::UnsupportedFeature(feature.to_string(), "non-v4".to_string()))
+}
+
+/// 发一个 V4 业务请求，把整包 {code,msg,data} 原样交回调用方。
+/// 与 crate 的封装不同，这里不把非 0 的 code 折叠成 Error——data 得留给上层。
+async fn v4_call_json(
+    v4: &ApiV4Client,
+    method: reqwest::Method,
+    endpoint: &str,
+    body: Option<serde_json::Value>,
+) -> Result<V4ApiResponse<serde_json::Value>, ApiError> {
+    let url = format!("{}{}", v4.base_url.trim_end_matches('/'), endpoint);
+    let mut request = v4.http_client.request(method, &url);
+    if let Some(body) = body {
+        request = request.json(&body);
+    }
+    if let Some(token) = &v4.token {
+        request = request.bearer_auth(token);
+    }
+    let response: V4ApiResponse<serde_json::Value> = request.send().await?.json().await?;
+    if v4_auth_expired(response.code, &response.msg) {
+        return Err(ApiError::Unauthorized(response.msg));
+    }
+    Ok(response)
+}
+
+/// 锁感知删除单个对象。返回服务端原始 {code,msg,data} 的 JSON 字符串：
+/// code=40073 时 data 里是冲突文件与解锁 token，上层据此决定要不要解除占用。
+#[napi]
+pub async fn delete_object_lock_aware(path: String) -> napi::Result<String> {
+    run_api_with_v4_refresh(|api| {
+        let path = path.clone();
+        async move {
+            let v4 = v4_client_of(&api, "lock-aware delete")?;
+            let body = json!({
+                "uris": [v4_path_to_uri(&path)],
+                "unlink": false,
+                "skip_soft_delete": false,
+            });
+            let response =
+                v4_call_json(v4, reqwest::Method::DELETE, "/api/v4/file", Some(body)).await?;
+            serde_json::to_string(&response).map_err(ApiError::from)
+        }
+    })
+    .await
+}
+
+/// 按 token 批量解除云端文件锁。
+#[napi]
+pub async fn unlock_files(tokens: Vec<String>) -> napi::Result<()> {
+    run_api_with_v4_refresh(|api| {
+        let tokens = tokens.clone();
+        async move {
+            let v4 = v4_client_of(&api, "unlock")?;
+            let body = json!({ "tokens": tokens });
+            let response =
+                v4_call_json(v4, reqwest::Method::DELETE, "/api/v4/file/lock", Some(body)).await?;
+            if response.code != 0 {
+                return Err(ApiError::Api {
+                    code: response.code,
+                    message: response.msg,
+                });
+            }
+            Ok(())
+        }
+    })
+    .await
+}
+
+/// 单文件 metadata 点查，用于"上传中"角标。返回 metadata 对象的 JSON，没有则返回 "{}"。
+#[napi]
+pub async fn get_file_metadata(path: String) -> napi::Result<String> {
+    run_api_with_v4_refresh(|api| {
+        let path = path.clone();
+        async move {
+            let v4 = v4_client_of(&api, "file metadata")?;
+            let endpoint = format!(
+                "/api/v4/file/info?uri={}",
+                encode_query_component(&v4_path_to_uri(&path))
+            );
+            let response = v4_call_json(v4, reqwest::Method::GET, &endpoint, None).await?;
+            if response.code != 0 {
+                return Err(ApiError::Api {
+                    code: response.code,
+                    message: response.msg,
+                });
+            }
+            let metadata = response
+                .data
+                .as_ref()
+                .and_then(|data| data.get("metadata"))
+                .cloned()
+                .unwrap_or_else(|| json!({}));
+            serde_json::to_string(&metadata).map_err(ApiError::from)
+        }
+    })
+    .await
+}
+
+/// 搜索结果比目录列表多一个 metadata（缩略图可用性要看它），单开一个序列化结构。
+#[derive(Serialize)]
+struct ApiSearchObjectInfo {
+    id: String,
+    name: String,
+    path: String,
+    thumb: bool,
+    size: i64,
+    #[serde(rename = "type")]
+    object_type: &'static str,
+    date: String,
+    create_date: String,
+    source_enabled: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    metadata: Option<serde_json::Value>,
+}
+
+const SEARCH_PAGE_SIZE: u32 = 2000;
+const SEARCH_MAX_PAGES: u32 = 100;
+
+/// V4 搜索用的 uri：目录段逐段编码，关键词放在 query 上。
+fn v4_search_uri(path: &str, keyword: &str) -> String {
+    let normalized = path
+        .split('/')
+        .filter(|segment| !segment.is_empty())
+        .map(|segment| encode_query_component(segment))
+        .collect::<Vec<String>>()
+        .join("/");
+    format!(
+        "cloudreve://my/{}?name={}&case_folding=true",
+        normalized,
+        encode_query_component(keyword)
+    )
+}
+
+fn json_str(value: &serde_json::Value, key: &str) -> String {
+    value.get(key).and_then(|v| v.as_str()).unwrap_or("").to_string()
+}
+
+fn map_v4_search_file(item: &serde_json::Value) -> ApiSearchObjectInfo {
+    let metadata = item.get("metadata").filter(|m| !m.is_null()).cloned();
+    let is_dir = item.get("type").and_then(|v| v.as_i64()).unwrap_or(0) == 1;
+    let updated_at = json_str(item, "updated_at");
+    let created_at = json_str(item, "created_at");
+    // 服务端不给"有没有缩略图"的标志，只有显式禁用时才带 thumb:disabled。
+    let thumb_disabled = metadata
+        .as_ref()
+        .map(|m| m.get("thumb:disabled").is_some())
+        .unwrap_or(false);
+    let unix_path = v4_uri_to_unix(&json_str(item, "path"));
+    ApiSearchObjectInfo {
+        // id 必须是全路径，和 get_directory 的约定一致：下载、缩略图、预览在 V4 上
+        // 都是拿 id 去拼 cloudreve://my/<id>。以前 ArkTS 侧这里填的是服务端的文件 id，
+        // 搜索结果的缩略图和预览一律报 "Path not exist"。
+        id: unix_path.clone(),
+        name: json_str(item, "name"),
+        path: unix_parent(&unix_path),
+        thumb: !thumb_disabled && !is_dir,
+        size: item.get("size").and_then(|v| v.as_i64()).unwrap_or(0),
+        object_type: if is_dir { "dir" } else { "file" },
+        date: if updated_at.is_empty() { created_at.clone() } else { updated_at },
+        create_date: created_at,
+        source_enabled: true,
+        metadata,
+    }
+}
+
+async fn v4_search(api: &CloudreveAPI, keyword: &str, path: &str) -> Result<String, ApiError> {
+    let v4 = v4_client_of(api, "search")?;
+    let uri = encode_query_component(&v4_search_uri(path, keyword));
+    let mut objects: Vec<ApiSearchObjectInfo> = Vec::new();
+    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut next_page_token = String::new();
+
+    for page in 0..SEARCH_MAX_PAGES {
+        let mut endpoint = format!(
+            "/api/v4/file?uri={}&page={}&page_size={}",
+            uri, page, SEARCH_PAGE_SIZE
+        );
+        if !next_page_token.is_empty() {
+            endpoint.push_str(&format!(
+                "&next_page_token={}",
+                encode_query_component(&next_page_token)
+            ));
+        }
+        let response = v4_call_json(v4, reqwest::Method::GET, &endpoint, None).await?;
+        if response.code != 0 {
+            return Err(ApiError::Api {
+                code: response.code,
+                message: response.msg,
+            });
+        }
+        let data = response.data.unwrap_or_else(|| json!({}));
+        let files = data
+            .get("files")
+            .and_then(|v| v.as_array())
+            .cloned()
+            .unwrap_or_default();
+        let before = objects.len();
+        for item in &files {
+            let mapped = map_v4_search_file(item);
+            if seen.insert(mapped.id.clone()) {
+                objects.push(mapped);
+            }
+        }
+        // 服务端给不满一页，或整页都是已见过的 id，就没有下一页可翻了。
+        if (files.len() as u32) < SEARCH_PAGE_SIZE || objects.len() == before {
+            break;
+        }
+        next_page_token = data
+            .get("pagination")
+            .and_then(|p| p.get("next_page_token"))
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+    }
+
+    serde_json::to_string(&objects).map_err(ApiError::from)
+}
+
+async fn v3_search(api: &CloudreveAPI, keyword: &str, path: &str) -> Result<String, ApiError> {
+    let v3 = api
+        .inner()
+        .as_v3()
+        .ok_or_else(|| ApiError::UnsupportedFeature("search".to_string(), "non-v3".to_string()))?;
+    let query_path = if path.is_empty() { "/" } else { path };
+    let url = format!(
+        "{}/api/v3/file/search/keywords/{}?path={}",
+        v3.base_url.trim_end_matches('/'),
+        encode_query_component(keyword),
+        encode_query_component(query_path)
+    );
+    let mut request = v3.http_client.get(&url);
+    if let Some(cookie) = &v3.session_cookie {
+        request = request.header("Cookie", format!("cloudreve-session={}", cookie));
+    }
+    let response: V4ApiResponse<serde_json::Value> = request.send().await?.json().await?;
+    if response.code != 0 {
+        return Err(ApiError::Api {
+            code: response.code,
+            message: response.msg,
+        });
+    }
+    // V3 的 objects 已经是 ArkTS 那边 ObjectInfo 的形状，原样透传。
+    let objects = response
+        .data
+        .as_ref()
+        .and_then(|data| data.get("objects"))
+        .cloned()
+        .unwrap_or_else(|| json!([]));
+    serde_json::to_string(&objects).map_err(ApiError::from)
+}
+
+/// 服务端搜索。返回 ObjectInfo[] 的 JSON 数组，V3 / V4 形状一致。
+#[napi]
+pub async fn search_files(keyword: String, path: String) -> napi::Result<String> {
+    let api = get_client()?;
+    if api.inner().as_v3().is_some() {
+        return v3_search(&api, &keyword, &path)
+            .await
+            .map_err(|e| napi::Error::from_reason(e.to_string()));
+    }
+    run_api_with_v4_refresh(|api| {
+        let keyword = keyword.clone();
+        let path = path.clone();
+        async move { v4_search(&api, &keyword, &path).await }
+    })
+    .await
+}
+
 #[napi]
 pub async fn move_objects(
     items: Vec<String>,
