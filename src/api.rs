@@ -497,6 +497,39 @@ fn v4_task_type_to_i32(task_type: &TaskType) -> i32 {
 
 static CLIENT: OnceLock<Mutex<Option<CloudreveAPI>>> = OnceLock::new();
 static V4_REFRESH_TOKEN: OnceLock<Mutex<Option<String>>> = OnceLock::new();
+static HTTP_CLIENT: OnceLock<reqwest::Client> = OnceLock::new();
+
+/// 共享的 reqwest 客户端。
+///
+/// 分片上传原先每片 `Client::new()`，连接池随客户端一起丢弃，于是每个分片都要重做
+/// 一次 TCP + TLS 握手。相册备份 5 并发时这部分 TLS 计算相当可观，在手机上会和渲染
+/// 抢核心。`Client` 内部是 Arc，clone 很便宜，复用即可共享连接池。
+fn http_client() -> reqwest::Client {
+    HTTP_CLIENT
+        .get_or_init(|| {
+            reqwest::Client::builder()
+                // 分片上传的 body 是流，reqwest 无法重放，所以拿到一条服务端已经关掉的
+                // 空闲连接时不会自动重试，会直接报传输错误。取一个明显短于常见服务端
+                // keep-alive（nginx 默认 75s）的空闲上限，既保留连接复用省下的 TLS 握手，
+                // 又基本不会复用到已经失效的连接。
+                .pool_idle_timeout(std::time::Duration::from_secs(30))
+                .build()
+                .unwrap_or_else(|_| reqwest::Client::new())
+        })
+        .clone()
+}
+
+/// reqwest::Error 的 Display 只有一句概括（"error sending request for url (...)"），
+/// 真正的原因在 source 链里。上传失败要靠这条信息定位，展开成一行返回给 ETS。
+fn describe_error<E: std::error::Error>(err: E) -> String {
+    let mut text = err.to_string();
+    let mut cause = err.source();
+    while let Some(inner) = cause {
+        text.push_str(&format!(": {}", inner));
+        cause = inner.source();
+    }
+    text
+}
 
 fn state() -> &'static Mutex<Option<CloudreveAPI>> {
     CLIENT.get_or_init(|| Mutex::new(None))
@@ -1591,8 +1624,7 @@ pub async fn upload_local_file_chunk_to_url(
     let (buffer, read_len) = read_local_chunk(&local_path, offset, length)?;
     let separator = if upload_url.contains('?') { "&" } else { "?" };
     let url = format!("{}{}chunk={}", upload_url, separator, index);
-    let client = reqwest::Client::new();
-    let mut request = client.post(url).body(buffer);
+    let mut request = http_client().post(url).body(buffer);
     if !credential.is_empty() {
         request = request.header("Authorization", credential);
     }
@@ -1626,13 +1658,35 @@ async fn upload_local_file_to_url_with_progress(
     let mut file = tokio::fs::File::open(&local_path)
         .await
         .map_err(|e| napi::Error::from_reason(format!("open local file failed: {}", e)))?;
-    file.seek(std::io::SeekFrom::Start(offset.max(0.0) as u64))
+    let start = offset.max(0.0) as u64;
+    // Content-Length 必须和实际能读出的字节数一致。调用方传的 length 来自媒体库元数据，
+    // 可能比文件真实大小大（刚拍的照片被相机后处理改写过）；真按它声明长度就会发出一个
+    // 短于 Content-Length 的 body，hyper 只能把连接判定为出错，表现为一个含义不明的
+    // "error sending request"，而且会稳定复现。这里按文件真实大小夹一次。
+    let file_len = file
+        .metadata()
+        .await
+        .map(|m| m.len())
+        .map_err(|e| napi::Error::from_reason(format!("stat local file failed: {}", e)))?;
+    let available = file_len.saturating_sub(start);
+    let length = (length as u64).min(available) as u32;
+    if length == 0 {
+        return Err(napi::Error::from_reason(format!(
+            "nothing to upload: file is {} bytes, offset {}",
+            file_len, start
+        )));
+    }
+    file.seek(std::io::SeekFrom::Start(start))
         .await
         .map_err(|e| napi::Error::from_reason(format!("seek local file failed: {}", e)))?;
 
+    // 进度回调按 PROGRESS_NOTIFY_STEP 节流。每读 256KB 回调一次的话，5 并发满速
+    // 能往 ETS 的 UI 线程事件循环里灌每秒两百多个任务；ETS 侧只拿它做长时任务通知的
+    // 保活判断，不需要这个精度。`reported` 记录上一次已上报的字节数。
+    const PROGRESS_NOTIFY_STEP: u64 = 4 * 1024 * 1024;
     let stream = futures_util::stream::unfold(
-        (file, length as u64, 0u64, tsfn.clone()),
-        |(mut file, remaining, sent, tsfn)| async move {
+        (file, length as u64, 0u64, 0u64, tsfn.clone()),
+        |(mut file, remaining, sent, reported, tsfn)| async move {
             if remaining == 0 {
                 return None;
             }
@@ -1643,15 +1697,23 @@ async fn upload_local_file_to_url_with_progress(
                 Ok(n) => {
                     buffer.truncate(n);
                     let next_sent = sent + n as u64;
-                    let _ = tsfn.call(next_sent as f64, ThreadsafeFunctionCallMode::NonBlocking);
-                    Some((Ok::<Vec<u8>, std::io::Error>(buffer), (file, remaining - n as u64, next_sent, tsfn)))
+                    let next_reported = if next_sent - reported >= PROGRESS_NOTIFY_STEP {
+                        let _ = tsfn.call(next_sent as f64, ThreadsafeFunctionCallMode::NonBlocking);
+                        next_sent
+                    } else {
+                        reported
+                    };
+                    Some((
+                        Ok::<Vec<u8>, std::io::Error>(buffer),
+                        (file, remaining - n as u64, next_sent, next_reported, tsfn),
+                    ))
                 }
-                Err(e) => Some((Err(e), (file, 0, sent, tsfn))),
+                Err(e) => Some((Err(e), (file, 0, sent, reported, tsfn))),
             }
         },
     );
 
-    let mut request = reqwest::Client::new()
+    let mut request = http_client()
         .post(url)
         .header(reqwest::header::CONTENT_TYPE, "application/octet-stream")
         .header(reqwest::header::CONTENT_LENGTH, length.to_string())
@@ -1664,7 +1726,7 @@ async fn upload_local_file_to_url_with_progress(
     let response = request
         .send()
         .await
-        .map_err(|e| napi::Error::from_reason(e.to_string()))?;
+        .map_err(|e| napi::Error::from_reason(describe_error(e)))?;
     let status = response.status();
     if !status.is_success() {
         let error_text = response
