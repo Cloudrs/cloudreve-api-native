@@ -22,9 +22,9 @@ use cloudreve_api::{
             MoveFileRequest as V4MoveFileRequest,
             CreateFileRequest as V4CreateFileRequest, CreateFileType as V4CreateFileType,
             DeleteFileRequest as V4DeleteFileRequest, UnlockFilesRequest,
-            SearchFilesRequest as V4SearchFilesRequest, File as V4File,
+            ListFilesRequest as V4ListFilesRequest, File as V4File,
         },
-        uri::path_to_uri as v4_path_to_uri,
+        uri::{path_to_uri as v4_path_to_uri, search_uri as v4_search_uri},
     },
     cloudreve_api::{SiteConfigValue, FileList, FileListAll, DeleteResult, ItemFailure, TransferResult},
 };
@@ -1337,6 +1337,9 @@ struct ApiSearchObjectInfo {
 }
 
 const SEARCH_PAGE_SIZE: u32 = 2000;
+/// 搜索结果按修改时间倒序：最近动过的排前面，符合"找我刚存的那个文件"的直觉
+const SEARCH_ORDER_BY: &str = "updated_at";
+const SEARCH_ORDER_DIRECTION: &str = "desc";
 const SEARCH_MAX_PAGES: u32 = 100;
 
 fn map_v4_search_file(file: &V4File) -> ApiSearchObjectInfo {
@@ -1378,14 +1381,19 @@ async fn v4_search(api: &CloudreveAPI, keyword: &str, path: &str) -> Result<Stri
     let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
     let mut next_page_token: Option<String> = None;
 
+    // 搜索走的是列目录同一个接口，只是 uri 自带 query。这里直接用 list_files 而不是
+    // crate 的 search_files，为的是能指定排序——后者不带排序参数，服务端会按自己的
+    // 内部顺序返回，看上去就是乱的。
+    let uri = v4_search_uri(path, keyword, true);
+
     for page in 0..SEARCH_MAX_PAGES {
         let response = v4
-            .search_files(&V4SearchFilesRequest {
-                path,
-                keyword,
-                case_folding: true,
+            .list_files(&V4ListFilesRequest {
+                path: &uri,
                 page: Some(page),
                 page_size: Some(SEARCH_PAGE_SIZE),
+                order_by: Some(SEARCH_ORDER_BY),
+                order_direction: Some(SEARCH_ORDER_DIRECTION),
                 next_page_token: next_page_token.as_deref(),
             })
             .await?;
@@ -1407,6 +1415,12 @@ async fn v4_search(api: &CloudreveAPI, keyword: &str, path: &str) -> Result<Stri
             break;
         }
     }
+
+    // order_by 只在服务端自己的分组内生效：实测同一目录的结果连续有序，一换目录就
+    // 跳回最新重新倒序。全局顺序只能这里来定。
+    // date 是 ISO 8601 且时区一致，直接按字符串倒序即可；取不到时间的（会是 1970）
+    // 自然沉到末尾。
+    objects.sort_by(|a, b| b.date.cmp(&a.date));
 
     serde_json::to_string(&objects).map_err(ApiError::from)
 }
