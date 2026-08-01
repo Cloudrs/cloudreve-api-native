@@ -2623,8 +2623,17 @@ pub async fn get_thumb(id: String) -> napi::Result<String> {
         let resp: V4ApiResponse<V4ThumbData> = v4.get(&endpoint).await
             .map_err(|e| napi::Error::from_reason(e.to_string()))?;
         // Return the pre-signed CDN URL — ArkTS createImageSource can fetch it without extra auth
+        // 没有 data 时不能直接拿 resp.msg 当错误文案：Cloudreve 成功时 msg 就是空串，
+        // 上层日志会打出个 "msg=" 什么也说明不了。这里补一句带业务码的说明。
         resp.data
-            .ok_or_else(|| napi::Error::from_reason(resp.msg))
+            .ok_or_else(|| {
+                let reason = if resp.msg.is_empty() {
+                    format!("thumbnail unavailable (code {})", resp.code)
+                } else {
+                    format!("{} (code {})", resp.msg, resp.code)
+                };
+                napi::Error::from_reason(reason)
+            })
             .map(|d| d.url)
     }
 }
