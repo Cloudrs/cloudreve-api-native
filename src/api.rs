@@ -20,10 +20,13 @@ use cloudreve_api::{
             CreateArchiveRequest, ExtractArchiveRequest,
             RefreshTokenRequest,
             MoveFileRequest as V4MoveFileRequest,
+            CreateFileRequest as V4CreateFileRequest, CreateFileType as V4CreateFileType,
+            DeleteFileRequest as V4DeleteFileRequest, UnlockFilesRequest,
+            SearchFilesRequest as V4SearchFilesRequest, File as V4File,
         },
         uri::path_to_uri as v4_path_to_uri,
     },
-    cloudreve_api::{SiteConfigValue, FileList, FileListAll},
+    cloudreve_api::{SiteConfigValue, FileList, FileListAll, DeleteResult, ItemFailure, TransferResult},
 };
 use serde::{Deserialize, Serialize};
 use serde_json::json;
@@ -1072,60 +1075,39 @@ pub async fn get_object_detail(id: String, is_folder: bool) -> napi::Result<Stri
 
 // ---- Object operations ----
 
+/// V4 下 items/dirs 里装的是完整路径（见 ApiObjectInfo.id），正好是 crate
+/// 批量接口要的形状，锁冲突剥离和 aggregated_error 分账都由它负责。
 async fn v4_do_delete(api: &CloudreveAPI, items: &[String], dirs: &[String]) -> Result<(), ApiError> {
-    for path in items.iter().chain(dirs.iter()) {
-        let v4 = api.inner().as_v4()
-            .ok_or_else(|| ApiError::UnsupportedFeature("delete".to_string(), "non-v4".to_string()))?;
-        let uri = v4_path_to_uri(path);
-        let url = format!("{}/api/v4/file", v4.base_url.trim_end_matches('/'));
-        let body = json!({
-            "uris": [uri],
-            "unlink": false,
-            "skip_soft_delete": false,
-        });
-        let mut request = v4.http_client.delete(&url).json(&body);
-        if let Some(token) = &v4.token {
-            request = request.bearer_auth(token);
-        }
-        let response: V4ApiResponse<serde_json::Value> = request
-            .send()
-            .await?
-            .json()
-            .await?;
-        if response.code != 0 {
-            return Err(ApiError::Api {
-                code: response.code,
-                message: response.msg,
-            });
-        }
+    let paths: Vec<&str> = items.iter().chain(dirs.iter()).map(String::as_str).collect();
+    if paths.is_empty() {
+        return Ok(());
     }
-    Ok(())
+    let result = api.batch_delete(&paths).await?;
+    if batch_auth_expired(&result.errors) {
+        return Err(ApiError::Unauthorized("Login required".to_string()));
+    }
+    match result.errors.first() {
+        None => Ok(()),
+        Some(failure) => Err(ApiError::Api {
+            code: failure.code.unwrap_or(-1),
+            message: failure.message.clone(),
+        }),
+    }
 }
 
 async fn v4_create_object(v4: &ApiV4Client, path: &str, object_type: &str) -> Result<(), ApiError> {
-    let uri = v4_path_to_uri(path);
-    let url = format!("{}/api/v4/file/create", v4.base_url.trim_end_matches('/'));
-    let body = json!({
-        "uri": uri,
-        "type": object_type,
-        "err_on_conflict": true,
-    });
-    let mut request = v4.http_client.post(&url).json(&body);
-    if let Some(token) = &v4.token {
-        request = request.bearer_auth(token);
-    }
-    let response: V4ApiResponse<serde_json::Value> = request
-        .send()
-        .await?
-        .json()
-        .await?;
-    if response.code != 0 {
-        return Err(ApiError::Api {
-            code: response.code,
-            message: response.msg,
-        });
-    }
-    Ok(())
+    let request = V4CreateFileRequest {
+        uri: path,
+        r#type: if object_type == "folder" {
+            V4CreateFileType::Folder
+        } else {
+            V4CreateFileType::File
+        },
+        metadata: None,
+        // 重名时直接报错，交给上层去问用户，而不是静默返回既有对象
+        err_on_conflict: Some(true),
+    };
+    v4.create_file(&request).await.map(|_| ())
 }
 
 // dst is always a destination *directory*; call the raw /file/move endpoint directly.
@@ -1195,6 +1177,36 @@ fn v4_auth_expired(code: i32, msg: &str) -> bool {
     code == 401 || msg.to_ascii_lowercase().contains("login required")
 }
 
+/// crate 只把 code=401 认成 Unauthorized，40081 + "Login required" 那条会原样
+/// 上抛成普通业务错误。不在这里翻译一下，刷新重试就轮不到执行，token 一过期
+/// 删除又会永久失败。批量错误还得往子项里看——外层 msg 只是 "One or more
+/// operation failed"，真正的 "Login required" 在每个 uri 自己的条目里。
+fn normalize_v4_auth_error(err: ApiError) -> ApiError {
+    let expired = match &err {
+        ApiError::Api { code, message }
+        | ApiError::ApiWithData { code, message, .. } => v4_auth_expired(*code, message),
+        ApiError::Aggregate { code, message, errors } => {
+            v4_auth_expired(*code, message)
+                || errors.values().any(|item| v4_auth_expired(item.code, &item.msg))
+        }
+        _ => false,
+    };
+    if expired {
+        ApiError::Unauthorized(err.message().unwrap_or("Login required").to_string())
+    } else {
+        err
+    }
+}
+
+/// 同样的判断，用在那些把失败摊平进结果里、不走 Err 的批量返回上。
+/// 全部条目都是登录失效才算——个别文件的古怪消息不该触发整体刷新。
+fn batch_auth_expired(failures: &[ItemFailure]) -> bool {
+    !failures.is_empty()
+        && failures
+            .iter()
+            .all(|item| v4_auth_expired(item.code.unwrap_or(0), &item.message))
+}
+
 fn v4_client_of<'a>(api: &'a CloudreveAPI, feature: &str) -> Result<&'a ApiV4Client, ApiError> {
     api.inner()
         .as_v4()
@@ -1232,14 +1244,28 @@ pub async fn delete_object_lock_aware(path: String) -> napi::Result<String> {
         let path = path.clone();
         async move {
             let v4 = v4_client_of(&api, "lock-aware delete")?;
-            let body = json!({
-                "uris": [v4_path_to_uri(&path)],
-                "unlink": false,
-                "skip_soft_delete": false,
-            });
-            let response =
-                v4_call_json(v4, reqwest::Method::DELETE, "/api/v4/file", Some(body)).await?;
-            serde_json::to_string(&response).map_err(ApiError::from)
+            let request = V4DeleteFileRequest {
+                uris: vec![path.as_str()],
+                unlink: None,
+                skip_soft_delete: None,
+            };
+            match v4.delete_files(&request).await {
+                Ok(()) => Ok(json!({ "code": 0, "msg": "", "data": null }).to_string()),
+                Err(err) => {
+                    // 登录失效要往上抛，好让外层刷新 token 重试；其余按原来的
+                    // {code,msg,data} 形状交回 ArkTS——40073 的锁 token 就在 data 里。
+                    let err = normalize_v4_auth_error(err);
+                    if matches!(err, ApiError::Unauthorized(_)) {
+                        return Err(err);
+                    }
+                    Ok(json!({
+                        "code": err.code().unwrap_or(-1),
+                        "msg": err.message().unwrap_or_default(),
+                        "data": err.data().cloned().unwrap_or(serde_json::Value::Null),
+                    })
+                    .to_string())
+                }
+            }
         }
     })
     .await
@@ -1252,16 +1278,12 @@ pub async fn unlock_files(tokens: Vec<String>) -> napi::Result<()> {
         let tokens = tokens.clone();
         async move {
             let v4 = v4_client_of(&api, "unlock")?;
-            let body = json!({ "tokens": tokens });
-            let response =
-                v4_call_json(v4, reqwest::Method::DELETE, "/api/v4/file/lock", Some(body)).await?;
-            if response.code != 0 {
-                return Err(ApiError::Api {
-                    code: response.code,
-                    message: response.msg,
-                });
-            }
-            Ok(())
+            let request = UnlockFilesRequest {
+                tokens: tokens.iter().map(String::as_str).collect(),
+            };
+            v4.unlock_files(&request)
+                .await
+                .map_err(normalize_v4_auth_error)
         }
     })
     .await
@@ -1317,48 +1339,34 @@ struct ApiSearchObjectInfo {
 const SEARCH_PAGE_SIZE: u32 = 2000;
 const SEARCH_MAX_PAGES: u32 = 100;
 
-/// V4 搜索用的 uri：目录段逐段编码，关键词放在 query 上。
-fn v4_search_uri(path: &str, keyword: &str) -> String {
-    let normalized = path
-        .split('/')
-        .filter(|segment| !segment.is_empty())
-        .map(|segment| encode_query_component(segment))
-        .collect::<Vec<String>>()
-        .join("/");
-    format!(
-        "cloudreve://my/{}?name={}&case_folding=true",
-        normalized,
-        encode_query_component(keyword)
-    )
-}
-
-fn json_str(value: &serde_json::Value, key: &str) -> String {
-    value.get(key).and_then(|v| v.as_str()).unwrap_or("").to_string()
-}
-
-fn map_v4_search_file(item: &serde_json::Value) -> ApiSearchObjectInfo {
-    let metadata = item.get("metadata").filter(|m| !m.is_null()).cloned();
-    let is_dir = item.get("type").and_then(|v| v.as_i64()).unwrap_or(0) == 1;
-    let updated_at = json_str(item, "updated_at");
-    let created_at = json_str(item, "created_at");
+fn map_v4_search_file(file: &V4File) -> ApiSearchObjectInfo {
+    let metadata = file.metadata.clone().filter(|m| !m.is_null());
+    let is_dir = matches!(file.r#type, V4FileType::Folder);
     // 服务端不给"有没有缩略图"的标志，只有显式禁用时才带 thumb:disabled。
     let thumb_disabled = metadata
         .as_ref()
         .map(|m| m.get("thumb:disabled").is_some())
         .unwrap_or(false);
-    let unix_path = v4_uri_to_unix(&json_str(item, "path"));
+    // 还得按扩展名筛一道，和目录列表同一套判断。否则搜出一堆压缩包、文档时，
+    // 每个都会去请求一次注定失败的缩略图。
+    let thumb = !is_dir && !thumb_disabled && supports_thumbnail(&file.name);
+    let unix_path = v4_uri_to_unix(&file.path);
     ApiSearchObjectInfo {
         // id 必须是全路径，和 get_directory 的约定一致：下载、缩略图、预览在 V4 上
         // 都是拿 id 去拼 cloudreve://my/<id>。以前 ArkTS 侧这里填的是服务端的文件 id，
         // 搜索结果的缩略图和预览一律报 "Path not exist"。
         id: unix_path.clone(),
-        name: json_str(item, "name"),
+        name: file.name.clone(),
         path: unix_parent(&unix_path),
-        thumb: !thumb_disabled && !is_dir,
-        size: item.get("size").and_then(|v| v.as_i64()).unwrap_or(0),
+        thumb,
+        size: file.size,
         object_type: if is_dir { "dir" } else { "file" },
-        date: if updated_at.is_empty() { created_at.clone() } else { updated_at },
-        create_date: created_at,
+        date: if file.updated_at.is_empty() {
+            file.created_at.clone()
+        } else {
+            file.updated_at.clone()
+        },
+        create_date: file.created_at.clone(),
         source_enabled: true,
         metadata,
     }
@@ -1366,52 +1374,38 @@ fn map_v4_search_file(item: &serde_json::Value) -> ApiSearchObjectInfo {
 
 async fn v4_search(api: &CloudreveAPI, keyword: &str, path: &str) -> Result<String, ApiError> {
     let v4 = v4_client_of(api, "search")?;
-    let uri = encode_query_component(&v4_search_uri(path, keyword));
     let mut objects: Vec<ApiSearchObjectInfo> = Vec::new();
     let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
-    let mut next_page_token = String::new();
+    let mut next_page_token: Option<String> = None;
 
     for page in 0..SEARCH_MAX_PAGES {
-        let mut endpoint = format!(
-            "/api/v4/file?uri={}&page={}&page_size={}",
-            uri, page, SEARCH_PAGE_SIZE
-        );
-        if !next_page_token.is_empty() {
-            endpoint.push_str(&format!(
-                "&next_page_token={}",
-                encode_query_component(&next_page_token)
-            ));
-        }
-        let response = v4_call_json(v4, reqwest::Method::GET, &endpoint, None).await?;
-        if response.code != 0 {
-            return Err(ApiError::Api {
-                code: response.code,
-                message: response.msg,
-            });
-        }
-        let data = response.data.unwrap_or_else(|| json!({}));
-        let files = data
-            .get("files")
-            .and_then(|v| v.as_array())
-            .cloned()
-            .unwrap_or_default();
+        let response = v4
+            .search_files(&V4SearchFilesRequest {
+                path,
+                keyword,
+                case_folding: true,
+                page: Some(page),
+                page_size: Some(SEARCH_PAGE_SIZE),
+                next_page_token: next_page_token.as_deref(),
+            })
+            .await?;
+
+        let returned = response.files.len();
         let before = objects.len();
-        for item in &files {
-            let mapped = map_v4_search_file(item);
+        for file in &response.files {
+            let mapped = map_v4_search_file(file);
             if seen.insert(mapped.id.clone()) {
                 objects.push(mapped);
             }
         }
-        // 服务端给不满一页，或整页都是已见过的 id，就没有下一页可翻了。
-        if (files.len() as u32) < SEARCH_PAGE_SIZE || objects.len() == before {
+        next_page_token = response.pagination.next_token.clone();
+        // 服务端给不满一页、整页都是已见过的、或没有下一页游标，就到头了。
+        if (returned as u32) < SEARCH_PAGE_SIZE
+            || objects.len() == before
+            || next_page_token.is_none()
+        {
             break;
         }
-        next_page_token = data
-            .get("pagination")
-            .and_then(|p| p.get("next_page_token"))
-            .and_then(|v| v.as_str())
-            .unwrap_or("")
-            .to_string();
     }
 
     serde_json::to_string(&objects).map_err(ApiError::from)
@@ -1422,32 +1416,9 @@ async fn v3_search(api: &CloudreveAPI, keyword: &str, path: &str) -> Result<Stri
         .inner()
         .as_v3()
         .ok_or_else(|| ApiError::UnsupportedFeature("search".to_string(), "non-v3".to_string()))?;
-    let query_path = if path.is_empty() { "/" } else { path };
-    let url = format!(
-        "{}/api/v3/file/search/keywords/{}?path={}",
-        v3.base_url.trim_end_matches('/'),
-        encode_query_component(keyword),
-        encode_query_component(query_path)
-    );
-    let mut request = v3.http_client.get(&url);
-    if let Some(cookie) = &v3.session_cookie {
-        request = request.header("Cookie", format!("cloudreve-session={}", cookie));
-    }
-    let response: V4ApiResponse<serde_json::Value> = request.send().await?.json().await?;
-    if response.code != 0 {
-        return Err(ApiError::Api {
-            code: response.code,
-            message: response.msg,
-        });
-    }
     // V3 的 objects 已经是 ArkTS 那边 ObjectInfo 的形状，原样透传。
-    let objects = response
-        .data
-        .as_ref()
-        .and_then(|data| data.get("objects"))
-        .cloned()
-        .unwrap_or_else(|| json!([]));
-    serde_json::to_string(&objects).map_err(ApiError::from)
+    let list = v3.search_files(keyword, path).await?;
+    serde_json::to_string(&list.objects).map_err(ApiError::from)
 }
 
 /// 服务端搜索。返回 ObjectInfo[] 的 JSON 数组，V3 / V4 形状一致。
@@ -1528,6 +1499,177 @@ pub async fn copy_objects(
             async move { v4_do_copy(&api, &items, &dirs, &dst).await }
         }).await
     }
+}
+
+// ---- 批量删除 / 移动 / 复制 ----
+//
+// 服务端这三个接口本来就吃 uri 数组，一次请求能处理一整批。以前 ArkTS 侧
+// 一个文件发一次请求，是因为整批只回一个成败、拿不到逐项结果；现在 crate
+// 会把 aggregated_error 和锁冲突拆开回报，逐项信息就能一路带回 UI 了。
+
+#[derive(Serialize)]
+struct BatchFailure {
+    path: String,
+    code: i32,
+    message: String,
+    /// 40073 时服务端给的解锁 token
+    tokens: Vec<String>,
+}
+
+#[derive(Serialize)]
+struct BatchOutcome {
+    succeeded: u32,
+    failed: Vec<BatchFailure>,
+}
+
+/// 锁冲突条目里的 token；条目可能是单个对象，也可能是一组。
+fn conflict_tokens(data: Option<&serde_json::Value>) -> Vec<String> {
+    let Some(data) = data else {
+        return Vec::new();
+    };
+    let entries = match data.as_array() {
+        Some(items) => items.as_slice(),
+        None => std::slice::from_ref(data),
+    };
+    entries
+        .iter()
+        .filter_map(|item| item.get("token").and_then(|t| t.as_str()))
+        .map(str::to_string)
+        .collect()
+}
+
+fn to_batch_failures(failures: &[ItemFailure]) -> Vec<BatchFailure> {
+    failures
+        .iter()
+        .map(|item| BatchFailure {
+            path: item.path.clone(),
+            code: item.code.unwrap_or(-1),
+            message: item.message.clone(),
+            tokens: conflict_tokens(item.data.as_ref()),
+        })
+        .collect()
+}
+
+/// 整批失败时没有逐项信息，只能把同一个原因摊到每一项上。
+fn batch_outcome_all_failed(paths: &[String], err: &ApiError) -> BatchOutcome {
+    BatchOutcome {
+        succeeded: 0,
+        failed: paths
+            .iter()
+            .map(|path| BatchFailure {
+                path: path.clone(),
+                code: err.code().unwrap_or(-1),
+                message: err.message().unwrap_or("operation failed").to_string(),
+                tokens: Vec::new(),
+            })
+            .collect(),
+    }
+}
+
+fn serialize_outcome(outcome: &BatchOutcome) -> Result<String, ApiError> {
+    serde_json::to_string(outcome).map_err(ApiError::from)
+}
+
+/// 一次删除多个对象，返回 {succeeded, failed:[{path,code,message,tokens}]} 的 JSON。
+/// 没出现在 failed 里的就是删成功了。
+#[napi]
+pub async fn delete_objects_batch(items: Vec<String>, dirs: Vec<String>) -> napi::Result<String> {
+    let api = get_client()?;
+    let all: Vec<String> = items.iter().chain(dirs.iter()).cloned().collect();
+    if all.is_empty() {
+        return serialize_outcome(&BatchOutcome { succeeded: 0, failed: Vec::new() })
+            .map_err(to_napi_error);
+    }
+
+    if let Some(v3) = api.inner().as_v3() {
+        // V3 按 id 寻址，一次请求就能带上整批
+        let req = DeleteObjectRequest {
+            items: items.iter().map(String::as_str).collect(),
+            dirs: dirs.iter().map(String::as_str).collect(),
+            force: false,
+            unlink: false,
+        };
+        let outcome = match v3.delete_object(&req).await {
+            Ok(_) => BatchOutcome { succeeded: all.len() as u32, failed: Vec::new() },
+            Err(err) => batch_outcome_all_failed(&all, &err),
+        };
+        return serialize_outcome(&outcome).map_err(to_napi_error);
+    }
+
+    run_api_with_v4_refresh(|api| {
+        let all = all.clone();
+        async move {
+            let paths: Vec<&str> = all.iter().map(String::as_str).collect();
+            let result: DeleteResult = api.batch_delete(&paths).await?;
+            if batch_auth_expired(&result.errors) {
+                return Err(ApiError::Unauthorized("Login required".to_string()));
+            }
+            serialize_outcome(&BatchOutcome {
+                succeeded: result.deleted as u32,
+                failed: to_batch_failures(&result.errors),
+            })
+        }
+    })
+    .await
+}
+
+/// 一次移动或复制多个对象，返回结构同 delete_objects_batch。
+#[napi]
+pub async fn transfer_objects_batch(
+    items: Vec<String>,
+    dirs: Vec<String>,
+    src_dir: String,
+    dst: String,
+    copy: bool,
+) -> napi::Result<String> {
+    let api = get_client()?;
+    let all: Vec<String> = items.iter().chain(dirs.iter()).cloned().collect();
+    if all.is_empty() {
+        return serialize_outcome(&BatchOutcome { succeeded: 0, failed: Vec::new() })
+            .map_err(to_napi_error);
+    }
+
+    if let Some(v3) = api.inner().as_v3() {
+        let src = SourceItems {
+            items: items.iter().map(String::as_str).collect(),
+            dirs: dirs.iter().map(String::as_str).collect(),
+        };
+        let outcome = if copy {
+            let req = CopyObjectRequest { src_dir: &src_dir, src, dst: &dst };
+            match v3.copy_object(&req).await {
+                Ok(_) => BatchOutcome { succeeded: all.len() as u32, failed: Vec::new() },
+                Err(err) => batch_outcome_all_failed(&all, &err),
+            }
+        } else {
+            let req = MoveObjectRequest { action: "move", src_dir: &src_dir, src, dst: &dst };
+            match v3.move_object(&req).await {
+                Ok(_) => BatchOutcome { succeeded: all.len() as u32, failed: Vec::new() },
+                Err(err) => batch_outcome_all_failed(&all, &err),
+            }
+        };
+        return serialize_outcome(&outcome).map_err(to_napi_error);
+    }
+
+    run_api_with_v4_refresh(|api| {
+        let all = all.clone();
+        let dst = dst.clone();
+        async move {
+            let paths: Vec<&str> = all.iter().map(String::as_str).collect();
+            let result: TransferResult = if copy {
+                api.batch_copy(&paths, &dst).await?
+            } else {
+                api.batch_move(&paths, &dst).await?
+            };
+            if batch_auth_expired(&result.errors) {
+                return Err(ApiError::Unauthorized("Login required".to_string()));
+            }
+            serialize_outcome(&BatchOutcome {
+                succeeded: result.succeeded as u32,
+                failed: to_batch_failures(&result.errors),
+            })
+        }
+    })
+    .await
 }
 
 #[napi]
