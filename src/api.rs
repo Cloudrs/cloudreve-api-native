@@ -500,6 +500,9 @@ fn v4_task_type_to_i32(task_type: &TaskType) -> i32 {
 
 static CLIENT: OnceLock<Mutex<Option<CloudreveAPI>>> = OnceLock::new();
 static V4_REFRESH_TOKEN: OnceLock<Mutex<Option<String>>> = OnceLock::new();
+/// Tokens minted by a silent 401 refresh, waiting for ETS to pick them up.
+/// (access_token, refresh_token, refresh_expires)
+static REFRESHED_SESSION: OnceLock<Mutex<Option<(String, String, String)>>> = OnceLock::new();
 static HTTP_CLIENT: OnceLock<reqwest::Client> = OnceLock::new();
 
 /// 共享的 reqwest 客户端。
@@ -562,6 +565,25 @@ fn set_v4_refresh(token: Option<String>) {
     *refresh_state().lock().unwrap() = token;
 }
 
+fn refreshed_session_state() -> &'static Mutex<Option<(String, String, String)>> {
+    REFRESHED_SESSION.get_or_init(|| Mutex::new(None))
+}
+
+/// Hand ETS the tokens produced by the most recent silent refresh, exactly once.
+/// Returns [access_token, refresh_token, refresh_expires], or an empty array when
+/// nothing has been refreshed since the last call.
+///
+/// A silent refresh only ever updated the in-process client, so a restart fell back
+/// to whatever ETS had persisted — stale by then. ETS polls this after every API
+/// call and writes the result to its database.
+#[napi(js_name = "takeRefreshedSession")]
+pub fn take_refreshed_session() -> Vec<String> {
+    match refreshed_session_state().lock().unwrap().take() {
+        Some((access, refresh, expires)) => vec![access, refresh, expires],
+        None => Vec::new(),
+    }
+}
+
 static V4_POLICY_ID: OnceLock<Mutex<Option<String>>> = OnceLock::new();
 
 fn policy_state() -> &'static Mutex<Option<String>> {
@@ -600,11 +622,16 @@ async fn do_v4_refresh() -> napi::Result<()> {
     // Apply new tokens to stored client
     let mut api = get_client()?;
     if let Some(v4) = api.inner_mut().as_v4_mut() {
-        v4.set_token(new_tok.access_token);
+        v4.set_token(new_tok.access_token.clone());
         v4.set_refresh_token(new_tok.refresh_token.clone());
     }
     set_client(api);
-    set_v4_refresh(Some(new_tok.refresh_token));
+    set_v4_refresh(Some(new_tok.refresh_token.clone()));
+    *refreshed_session_state().lock().unwrap() = Some((
+        new_tok.access_token,
+        new_tok.refresh_token,
+        new_tok.refresh_expires,
+    ));
     Ok(())
 }
 
@@ -678,6 +705,9 @@ where
 /// For v4: `access_token` is the JWT access token, `refresh_token` is the refresh token.
 #[napi]
 pub fn restore_session(base_url: String, access_token: String, refresh_token: String, is_v3: bool) -> napi::Result<()> {
+    // Drop anything the previous account's silent refresh left behind: once we switch
+    // accounts those tokens must never reach the incoming account's stored credentials.
+    refreshed_session_state().lock().unwrap().take();
     let version = if is_v3 { ApiVersion::V3 } else { ApiVersion::V4 };
     let mut api = CloudreveAPI::with_version(&base_url, version)
         .map_err(|e| napi::Error::from_reason(e.to_string()))?;
@@ -709,10 +739,18 @@ pub fn restore_session(base_url: String, access_token: String, refresh_token: St
 
 // ---- Auth ----
 
-fn extract_v4_tokens(response: &LoginResponse) -> (String, String) {
+/// (access_token, refresh_token, refresh_expires). The expiry is what the server
+/// actually grants the refresh token; without it the client has to guess, and a
+/// guessed lifetime makes the stored credential look valid long after it is not.
+/// v3 has no refresh token, so it yields an empty expiry and the client falls back.
+fn extract_v4_tokens(response: &LoginResponse) -> (String, String, String) {
     match response {
-        LoginResponse::V4(r) => (r.token.access_token.clone(), r.token.refresh_token.clone()),
-        _ => (String::new(), String::new()),
+        LoginResponse::V4(r) => (
+            r.token.access_token.clone(),
+            r.token.refresh_token.clone(),
+            r.token.refresh_expires.clone(),
+        ),
+        _ => (String::new(), String::new(), String::new()),
     }
 }
 
@@ -764,16 +802,20 @@ pub async fn login_with_refresh_token(base_url: String, refresh_token: String) -
     ])
 }
 
-/// Login. Returns [userJson, access_token, refresh_token, "v3"/"v4"].
-/// When 2FA is required, returns ["2fa_required", "", "", "v3"/"v4"].
+/// Login. Returns [userJson, access_token, refresh_token, "v3"/"v4", refresh_expires].
+/// When 2FA is required, returns ["2fa_required", "", "", "v3"/"v4", ""].
 #[napi]
 pub async fn login(username: String, password: String) -> napi::Result<Vec<String>> {
     let mut api = get_client()?;
     match api.login(&username, &password).await {
         Ok(response) => {
             let v3 = api.inner().is_v3();
-            let (access_token, refresh_token) = if v3 {
-                (api.get_session_cookie().unwrap_or_default(), String::new())
+            let (access_token, refresh_token, refresh_expires) = if v3 {
+                (
+                    api.get_session_cookie().unwrap_or_default(),
+                    String::new(),
+                    String::new(),
+                )
             } else {
                 let tokens = extract_v4_tokens(&response);
                 set_v4_refresh(Some(tokens.1.clone()));
@@ -785,18 +827,30 @@ pub async fn login(username: String, password: String) -> napi::Result<Vec<Strin
             }
             .map_err(|e| napi::Error::from_reason(e.to_string()))?;
             set_client(api);
-            Ok(vec![user_json, access_token, refresh_token, if v3 { "v3" } else { "v4" }.to_string()])
+            Ok(vec![
+                user_json,
+                access_token,
+                refresh_token,
+                if v3 { "v3" } else { "v4" }.to_string(),
+                refresh_expires,
+            ])
         }
         Err(ApiError::TwoFactorRequired(_)) => {
             let v3 = api.inner().is_v3();
             set_client(api);
-            Ok(vec!["2fa_required".to_string(), String::new(), String::new(), if v3 { "v3" } else { "v4" }.to_string()])
+            Ok(vec![
+                "2fa_required".to_string(),
+                String::new(),
+                String::new(),
+                if v3 { "v3" } else { "v4" }.to_string(),
+                String::new(),
+            ])
         }
         Err(e) => Err(napi::Error::from_reason(e.to_string())),
     }
 }
 
-/// Submit 2FA OTP code. Returns [userJson, access_token, refresh_token, "v3"/"v4"].
+/// Submit 2FA OTP code. Returns [userJson, access_token, refresh_token, "v3"/"v4", refresh_expires].
 #[napi(js_name = "login2fa")]
 pub async fn login_2fa(code: String) -> napi::Result<Vec<String>> {
     let mut api = get_client()?;
@@ -805,8 +859,12 @@ pub async fn login_2fa(code: String) -> napi::Result<Vec<String>> {
         .await
         .map_err(|e| napi::Error::from_reason(e.to_string()))?;
     let v3 = api.inner().is_v3();
-    let (access_token, refresh_token) = if v3 {
-        (api.get_session_cookie().unwrap_or_default(), String::new())
+    let (access_token, refresh_token, refresh_expires) = if v3 {
+        (
+            api.get_session_cookie().unwrap_or_default(),
+            String::new(),
+            String::new(),
+        )
     } else {
         let tokens = extract_v4_tokens(&response);
         set_v4_refresh(Some(tokens.1.clone()));
@@ -818,7 +876,13 @@ pub async fn login_2fa(code: String) -> napi::Result<Vec<String>> {
     }
     .map_err(|e| napi::Error::from_reason(e.to_string()))?;
     set_client(api);
-    Ok(vec![user_json, access_token, refresh_token, if v3 { "v3" } else { "v4" }.to_string()])
+    Ok(vec![
+        user_json,
+        access_token,
+        refresh_token,
+        if v3 { "v3" } else { "v4" }.to_string(),
+        refresh_expires,
+    ])
 }
 
 // ---- Site ----
