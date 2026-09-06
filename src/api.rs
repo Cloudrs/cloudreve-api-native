@@ -1857,14 +1857,28 @@ pub async fn get_download_uri(id: String) -> napi::Result<String> {
     }
 }
 
+/// Cloudreve V3「上传会话已过期」。删除一个服务端已经不认识的会话时会拿到它，
+/// 对清理路径来说就是"已经没有残留了"，按成功处理。
+const V3_CODE_UPLOAD_SESSION_EXPIRED: i32 = 40011;
+
 /// Cancel an in-flight upload session so the server clears its placeholder.
-/// V4: calls DELETE /file/upload. V3 has no public delete endpoint — the
-/// session expires server-side on its own, so we simply succeed quietly.
+/// V4: DELETE /file/upload。V3: DELETE /file/upload/{sessionId} —— 早先这里
+/// 直接返回 Ok，注释说 V3 没有删除接口，其实是有的（routers 里的
+/// `upload.DELETE(":sessionId")`）。空转的后果很重：V3 建会话时会插一条占位
+/// 文件记录，删不掉的话同名文件再传就一直撞 40054 "Upload session existed"，
+/// 要等服务端 GC（upload_session_timeout 默认 24h）才自己好。
 #[napi]
 pub async fn delete_upload_session(path: String, session_id: String) -> napi::Result<()> {
     let api = get_client()?;
-    if api.inner().as_v3().is_some() {
-        return Ok(());
+    if let Some(v3) = api.inner().as_v3() {
+        if session_id.is_empty() {
+            return Ok(());
+        }
+        return match v3.delete_upload_session(&session_id).await {
+            Ok(()) => Ok(()),
+            Err(ApiError::Api { code, .. }) if code == V3_CODE_UPLOAD_SESSION_EXPIRED => Ok(()),
+            Err(error) => Err(napi::Error::from_reason(error.to_string())),
+        };
     }
     run_api_with_v4_refresh(|api| {
         let path = path.clone();
@@ -1882,11 +1896,35 @@ pub async fn delete_upload_session(path: String, session_id: String) -> napi::Re
     .await
 }
 
+/// 兜底清理：删掉当前账号名下**全部**上传占位（V3 的 DELETE /file/upload）。
+///
+/// 用在 sessionId 已经丢了、按 id 删不掉的场景：进程被杀在上传中途、本地会话
+/// 记录被清、或者建会话的响应根本没回来。这些孤儿占位会让同名文件永远撞 40054，
+/// 而客户端手里没有任何 id 可以用来删它们。
+///
+/// 作用域是整个账号，正在进行中的上传也会被连带删掉占位，所以调用方必须确认
+/// 此刻没有别的上传在跑。V4 没有对应接口，返回 false 表示什么都没做。
+#[napi]
+pub async fn delete_all_upload_sessions() -> napi::Result<bool> {
+    let api = get_client()?;
+    match api.inner().as_v3() {
+        Some(v3) => match v3.delete_all_upload_sessions().await {
+            Ok(()) => Ok(true),
+            Err(ApiError::Api { code, .. }) if code == V3_CODE_UPLOAD_SESSION_EXPIRED => Ok(true),
+            Err(error) => Err(napi::Error::from_reason(error.to_string())),
+        },
+        None => Ok(false),
+    }
+}
+
 /// Returns upload session JSON: { sessionId, chunkSize, expires }
 #[napi]
 pub async fn get_upload_uri(
+    // 整个文件的字节数。必须是 f64：u32 到 4GiB 就回绕，一个 5GB 的文件会被
+    // 截成 705MB 报给服务端，会话按错误的大小建立，最后传出一个坏文件。
+    // ArkTS 的 number 本来就是 f64，整数精确到 2^53，接得住任何真实文件大小。
     path: String,
-    size: u32,
+    size: f64,
     name: String,
     // JavaScript Date milliseconds are ~1.7e12 and cannot fit in u32.
     // Using u32 truncated the high bits at the N-API boundary, turning
@@ -1902,6 +1940,13 @@ pub async fn get_upload_uri(
         } else {
             "/"
         };
+        // 目标目录不存在时先建出来，和下面 V4 分支一样。少了这一步，往一个还没
+        // 建过的目录传东西（典型场景：相册备份第一次跑，备份目录还不存在）会被
+        // 服务端挡回 40016 Path not exist，整批全灭。ensure_remote_directory 走的是
+        // UnifiedClient 的 list/create，两个版本都支持。
+        ensure_remote_directory(&api, parent)
+            .await
+            .map_err(|e| napi::Error::from_reason(e.to_string()))?;
         let dir = v3
             .list_directory(parent)
             .await
@@ -1910,9 +1955,12 @@ pub async fn get_upload_uri(
             path: parent,
             name: &name,
             policy_id: &dir.policy.id,
-            size: size as i64,
-            // Cloudreve V3 expects Unix seconds; V4 expects Unix milliseconds.
-            last_modified: if last_modified > 0 { last_modified / 1000 } else { 0 },
+            size: size.max(0.0) as i64,
+            // V3 和 V4 都要 Unix 毫秒。V3 服务端拿到就是
+            // time.UnixMilli(service.LastModified)（service/explorer/upload.go），
+            // 从这个字段引入时起一直如此。之前这里按秒除了 1000，2026 年的时间戳
+            // 被当成 1.7e9 毫秒，云端把刚传上去的文件标成 1970-01-22。
+            last_modified: if last_modified > 0 { last_modified } else { 0 },
             mime_type: &mime_type,
         };
         let session = v3
@@ -1952,7 +2000,7 @@ pub async fn get_upload_uri(
         let file_uri = v4_path_to_uri(&file_path);
         let req = CreateUploadSessionRequest {
             uri: &file_uri,
-            size: size as u64,
+            size: size.max(0.0) as u64,
             policy_id: &policy_id,
             last_modified: if last_modified > 0 { Some(last_modified as u64) } else { None },
             mime_type: if mime_type.is_empty() { None } else { Some(&mime_type) },
@@ -2002,6 +2050,36 @@ fn json_u64(value: &serde_json::Value, key: &str) -> Option<u64> {
     })
 }
 
+/// 覆盖保存一个**已存在**文件的内容（文本编辑器的保存走这条）。
+///
+/// V3 必须单独走 PUT /file/update/{id}：它的上传会话没有 overwrite 语义，
+/// 同名文件建会话会被服务端挡回 40004 Object existed，所以 upload_local_file
+/// 的 overwrite 参数在 V3 上根本不起作用。
+///
+/// V4 沿用创建上传会话 + entity_type=version 的老路，也就是 upload_local_file
+/// 本身，行为不变。
+///
+/// id 和 remote_path 都要传：V4 的对象 id 恰好就是全路径，V3 的是 hashid，
+/// 两边需要的东西不一样，不能靠一个参数糊过去。
+#[napi]
+pub async fn update_file_content(
+    id: String,
+    remote_path: String,
+    local_path: String,
+    last_modified_ms: Option<i64>,
+) -> napi::Result<()> {
+    let api = get_client()?;
+    if let Some(v3) = api.inner().as_v3() {
+        let content = fs::read(&local_path)
+            .map_err(|e| napi::Error::from_reason(format!("read local file failed: {}", e)))?;
+        return v3
+            .update_file_content(&id, content)
+            .await
+            .map_err(|e| napi::Error::from_reason(e.to_string()));
+    }
+    upload_local_file(local_path, remote_path, true, last_modified_ms).await
+}
+
 #[napi]
 pub async fn upload_local_file(
     local_path: String,
@@ -2033,8 +2111,8 @@ pub async fn upload_local_file_chunk(
     session_id: String,
     index: u32,
     offset: f64,
-    length: u32,
-) -> napi::Result<u32> {
+    length: f64,
+) -> napi::Result<f64> {
     let (buffer, read_len) = read_local_chunk(&local_path, offset, length)?;
 
     let api = get_client()?;
@@ -2043,11 +2121,9 @@ pub async fn upload_local_file_chunk(
             .await
             .map_err(|e| napi::Error::from_reason(e.to_string()))?;
     } else if let Some(v3) = api.inner().as_v3() {
-        if index > 0 {
-            return Err(napi::Error::from_reason(
-                "v3 chunked upload is not supported by the current native adapter",
-            ));
-        }
+        // 分片序号会被 v3 用来算 append 偏移（AppendStart = chunkSize * index），
+        // 早先这里拦掉 index > 0 是因为 crate 把 URL 写死成 /0；现在 crate 会带上
+        // 真实序号，多分片就能正常走了。
         v3.upload_chunk(&session_id, index, buffer)
             .await
             .map_err(|e| napi::Error::from_reason(e.to_string()))?;
@@ -2055,7 +2131,7 @@ pub async fn upload_local_file_chunk(
         return Err(napi::Error::from_reason("unsupported Cloudreve client"));
     }
 
-    Ok(read_len as u32)
+    Ok(read_len as f64)
 }
 
 #[napi]
@@ -2065,12 +2141,12 @@ pub fn upload_local_file_chunk_with_progress(
     session_id: String,
     index: u32,
     offset: f64,
-    length: u32,
+    length: f64,
     progress: JsFunction,
 ) -> napi::Result<JsObject> {
     let tsfn: ThreadsafeFunction<f64, ErrorStrategy::Fatal> =
         progress.create_threadsafe_function(0, |ctx| Ok(vec![ctx.value]))?;
-    let (deferred, promise) = env.create_deferred::<u32, _>()?;
+    let (deferred, promise) = env.create_deferred::<f64, _>()?;
     napi::bindgen_prelude::spawn(async move {
         let result = async {
             let api = get_client()?;
@@ -2085,16 +2161,36 @@ pub fn upload_local_file_chunk_with_progress(
                 upload_local_file_to_url_with_progress(
                     local_path,
                     url,
-                    auth_header,
+                    ChunkUploadTarget::AuthHeader(auth_header),
+                    offset,
+                    length,
+                    tsfn,
+                )
+                .await
+            } else if let Some(v3) = api.inner().as_v3() {
+                // 之前 V3 走的是"整块读进内存 → 传完 → 才回调一次进度"的兜底路径。
+                // 后果有两条：一是 V3 本机策略常见 chunkSize=0，整个文件就是一块，
+                // 上传全程进度停在 0%，用户只看得到流量在跑；二是几百 MB 的文件要
+                // 一次性分配同样大的 Vec 再交给 reqwest，峰值内存翻倍，大文件直接传崩。
+                // 现在和 V4 一样走流式，边读边发，顺带拿到分段进度。
+                let url = format!(
+                    "{}/api/v3/file/upload/{}/{}",
+                    v3.base_url.trim_end_matches('/'),
+                    session_id,
+                    index
+                );
+                let cookie = v3.get_session_cookie().map(|value| value.to_string());
+                upload_local_file_to_url_with_progress(
+                    local_path,
+                    url,
+                    ChunkUploadTarget::V3Cookie(cookie),
                     offset,
                     length,
                     tsfn,
                 )
                 .await
             } else {
-                let uploaded = upload_local_file_chunk(local_path, session_id, index, offset, length).await?;
-                let _ = tsfn.call(uploaded as f64, ThreadsafeFunctionCallMode::NonBlocking);
-                Ok(uploaded)
+                Err(napi::Error::from_reason("unsupported Cloudreve client"))
             }
         }.await;
 
@@ -2114,12 +2210,12 @@ pub fn upload_local_file_chunk_to_url_with_progress(
     credential: String,
     index: u32,
     offset: f64,
-    length: u32,
+    length: f64,
     progress: JsFunction,
 ) -> napi::Result<JsObject> {
     let tsfn: ThreadsafeFunction<f64, ErrorStrategy::Fatal> =
         progress.create_threadsafe_function(0, |ctx| Ok(vec![ctx.value]))?;
-    let (deferred, promise) = env.create_deferred::<u32, _>()?;
+    let (deferred, promise) = env.create_deferred::<f64, _>()?;
     napi::bindgen_prelude::spawn(async move {
         let separator = if upload_url.contains('?') { "&" } else { "?" };
         let url = format!("{}{}chunk={}", upload_url, separator, index);
@@ -2127,7 +2223,7 @@ pub fn upload_local_file_chunk_to_url_with_progress(
         let result = upload_local_file_to_url_with_progress(
             local_path,
             url,
-            auth_header,
+            ChunkUploadTarget::AuthHeader(auth_header),
             offset,
             length,
             tsfn,
@@ -2149,8 +2245,8 @@ pub async fn upload_local_file_chunk_to_url(
     credential: String,
     index: u32,
     offset: f64,
-    length: u32,
-) -> napi::Result<u32> {
+    length: f64,
+) -> napi::Result<f64> {
     let (buffer, read_len) = read_local_chunk(&local_path, offset, length)?;
     let separator = if upload_url.contains('?') { "&" } else { "?" };
     let url = format!("{}{}chunk={}", upload_url, separator, index);
@@ -2174,17 +2270,37 @@ pub async fn upload_local_file_chunk_to_url(
         )));
     }
 
-    Ok(read_len as u32)
+    Ok(read_len as f64)
+}
+
+/// 分片上传请求的鉴权方式，以及"这次算不算成功"的判据。
+///
+/// V4 和从机直传节点用 HTTP 状态码表达结果；V3 的上传接口一律回 200，真实结果
+/// 放在 body 的 `code` 里（`c.JSON(200, serializer.Err(...))`），只看状态码会把
+/// 失败当成功——分片没落盘却继续往前推 offset，最后传出一个坏文件。
+enum ChunkUploadTarget {
+    /// Authorization 头：V4 的 Bearer token，或从机节点的 credential。
+    AuthHeader(Option<String>),
+    /// V3 的 cloudreve-session cookie。
+    V3Cookie(Option<String>),
+}
+
+/// V3 上传接口的响应体，只取判成败要用的两个字段。
+#[derive(Deserialize)]
+struct V3ChunkUploadResponse {
+    code: i32,
+    #[serde(default)]
+    msg: String,
 }
 
 async fn upload_local_file_to_url_with_progress(
     local_path: String,
     url: String,
-    auth_header: Option<String>,
+    target: ChunkUploadTarget,
     offset: f64,
-    length: u32,
+    length: f64,
     tsfn: ThreadsafeFunction<f64, ErrorStrategy::Fatal>,
-) -> napi::Result<u32> {
+) -> napi::Result<f64> {
     let mut file = tokio::fs::File::open(&local_path)
         .await
         .map_err(|e| napi::Error::from_reason(format!("open local file failed: {}", e)))?;
@@ -2199,7 +2315,9 @@ async fn upload_local_file_to_url_with_progress(
         .map(|m| m.len())
         .map_err(|e| napi::Error::from_reason(format!("stat local file failed: {}", e)))?;
     let available = file_len.saturating_sub(start);
-    let length = (length as u64).min(available) as u32;
+    // 收成 u64 而不是 u32：不分片时整个文件就是一块，length 就是文件大小，
+    // 超过 4GiB 用 u32 会回绕。
+    let length = (if length > 0.0 { length as u64 } else { 0 }).min(available);
     if length == 0 {
         return Err(napi::Error::from_reason(format!(
             "nothing to upload: file is {} bytes, offset {}",
@@ -2215,7 +2333,7 @@ async fn upload_local_file_to_url_with_progress(
     // 保活判断，不需要这个精度。`reported` 记录上一次已上报的字节数。
     const PROGRESS_NOTIFY_STEP: u64 = 4 * 1024 * 1024;
     let stream = futures_util::stream::unfold(
-        (file, length as u64, 0u64, 0u64, tsfn.clone()),
+        (file, length, 0u64, 0u64, tsfn.clone()),
         |(mut file, remaining, sent, reported, tsfn)| async move {
             if remaining == 0 {
                 return None;
@@ -2249,8 +2367,15 @@ async fn upload_local_file_to_url_with_progress(
         .header(reqwest::header::CONTENT_LENGTH, length.to_string())
         .body(reqwest::Body::wrap_stream(stream));
 
-    if let Some(auth_header) = auth_header {
-        request = request.header(reqwest::header::AUTHORIZATION, auth_header);
+    let is_v3 = matches!(target, ChunkUploadTarget::V3Cookie(_));
+    match target {
+        ChunkUploadTarget::AuthHeader(Some(auth_header)) => {
+            request = request.header(reqwest::header::AUTHORIZATION, auth_header);
+        }
+        ChunkUploadTarget::V3Cookie(Some(cookie)) => {
+            request = request.header("Cookie", format!("cloudreve-session={}", cookie));
+        }
+        _ => {}
     }
 
     let response = request
@@ -2258,11 +2383,28 @@ async fn upload_local_file_to_url_with_progress(
         .await
         .map_err(|e| napi::Error::from_reason(describe_error(e)))?;
     let status = response.status();
+    let body = response.text().await.unwrap_or_default();
+
+    if is_v3 {
+        // V3 永远是 200，成败看 body 里的 code。解析不出来就退回按状态码判断。
+        if let Ok(parsed) = serde_json::from_str::<V3ChunkUploadResponse>(&body) {
+            if parsed.code != 0 {
+                return Err(napi::Error::from_reason(format!(
+                    "upload chunk failed: API error: {} (code: {})",
+                    parsed.msg, parsed.code
+                )));
+            }
+            let _ = tsfn.call(length as f64, ThreadsafeFunctionCallMode::NonBlocking);
+            return Ok(length as f64);
+        }
+    }
+
     if !status.is_success() {
-        let error_text = response
-            .text()
-            .await
-            .unwrap_or_else(|_| "Unknown upload error".to_string());
+        let error_text = if body.is_empty() {
+            "Unknown upload error".to_string()
+        } else {
+            body
+        };
         return Err(napi::Error::from_reason(format!(
             "upload chunk failed: {} {}",
             status, error_text
@@ -2270,19 +2412,36 @@ async fn upload_local_file_to_url_with_progress(
     }
 
     let _ = tsfn.call(length as f64, ThreadsafeFunctionCallMode::NonBlocking);
-    Ok(length)
+    Ok(length as f64)
 }
 
-fn read_local_chunk(local_path: &str, offset: f64, length: u32) -> napi::Result<(Vec<u8>, usize)> {
+/// 把 [offset, offset+length) 这段读进内存。
+///
+/// 必须循环读满：`Read::read` 允许一次只返回一部分，缓冲区越大越容易短读，
+/// 而调用方拿 read_len 当"这块的全部字节"往前推 offset，短读就等于把文件中间
+/// 挖掉一段传上去，服务端还会因为 Content-Length 对不上直接判错。读到 EOF
+/// 才停，返回真实读到的长度。
+fn read_local_chunk(local_path: &str, offset: f64, length: f64) -> napi::Result<(Vec<u8>, usize)> {
     let mut file = fs::File::open(local_path)
         .map_err(|e| napi::Error::from_reason(format!("open local file failed: {}", e)))?;
     file.seek(SeekFrom::Start(offset.max(0.0) as u64))
         .map_err(|e| napi::Error::from_reason(format!("seek local file failed: {}", e)))?;
 
-    let mut buffer = vec![0u8; length as usize];
-    let read_len = file
-        .read(&mut buffer)
-        .map_err(|e| napi::Error::from_reason(format!("read local chunk failed: {}", e)))?;
+    let mut buffer = vec![0u8; if length > 0.0 { length as usize } else { 0 }];
+    let mut read_len = 0usize;
+    while read_len < buffer.len() {
+        match file.read(&mut buffer[read_len..]) {
+            Ok(0) => break,
+            Ok(n) => read_len += n,
+            Err(ref e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(e) => {
+                return Err(napi::Error::from_reason(format!(
+                    "read local chunk failed: {}",
+                    e
+                )));
+            }
+        }
+    }
     buffer.truncate(read_len);
     Ok((buffer, read_len))
 }
