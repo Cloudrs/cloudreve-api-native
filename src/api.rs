@@ -1876,6 +1876,9 @@ pub async fn get_download_uri(id: String) -> napi::Result<String> {
 /// 对清理路径来说就是"已经没有残留了"，按成功处理。
 const V3_CODE_UPLOAD_SESSION_EXPIRED: i32 = 40011;
 
+/// Cloudreve V3「父目录不存在」。列目录拿到它就说明得先把目录建出来。
+const V3_CODE_PARENT_NOT_EXIST: i32 = 40016;
+
 /// Cancel an in-flight upload session so the server clears its placeholder.
 /// V4: DELETE /file/upload。V3: DELETE /file/upload/{sessionId} —— 早先这里
 /// 直接返回 Ok，注释说 V3 没有删除接口，其实是有的（routers 里的
@@ -1955,17 +1958,25 @@ pub async fn get_upload_uri(
         } else {
             "/"
         };
-        // 目标目录不存在时先建出来，和下面 V4 分支一样。少了这一步，往一个还没
-        // 建过的目录传东西（典型场景：相册备份第一次跑，备份目录还不存在）会被
-        // 服务端挡回 40016 Path not exist，整批全灭。ensure_remote_directory 走的是
-        // UnifiedClient 的 list/create，两个版本都支持。
-        ensure_remote_directory(&api, parent)
-            .await
-            .map_err(|e| napi::Error::from_reason(e.to_string()))?;
-        let dir = v3
-            .list_directory(parent)
-            .await
-            .map_err(|e| napi::Error::from_reason(e.to_string()))?;
+        // 建会话要用父目录的存储策略 id，所以本来就得列一次目录——顺带它也告诉了
+        // 我们父目录在不在。只有服务端明确回 40016 时才去把目录建出来再列一次
+        // （典型场景：相册备份第一次跑，备份目录还不存在，不建的话整批被挡回）。
+        //
+        // 早先是无条件先 ensure_remote_directory 一遍，而它会按路径段逐级
+        // list_files：传到 /Photos/Camera 就是每个文件额外两次列目录，47 张照片
+        // 就是 94 次，在大目录上非常贵（反馈里那台机器列一次要 43 秒）。
+        let dir = match v3.list_directory(parent).await {
+            Ok(dir) => dir,
+            Err(ApiError::Api { code, .. }) if code == V3_CODE_PARENT_NOT_EXIST => {
+                ensure_remote_directory(&api, parent)
+                    .await
+                    .map_err(|e| napi::Error::from_reason(e.to_string()))?;
+                v3.list_directory(parent)
+                    .await
+                    .map_err(|e| napi::Error::from_reason(e.to_string()))?
+            }
+            Err(error) => return Err(napi::Error::from_reason(error.to_string())),
+        };
         let req = UploadFileRequest {
             path: parent,
             name: &name,
@@ -2401,17 +2412,24 @@ async fn upload_local_file_to_url_with_progress(
     let body = response.text().await.unwrap_or_default();
 
     if is_v3 {
-        // V3 永远是 200，成败看 body 里的 code。解析不出来就退回按状态码判断。
-        if let Ok(parsed) = serde_json::from_str::<V3ChunkUploadResponse>(&body) {
-            if parsed.code != 0 {
-                return Err(napi::Error::from_reason(format!(
-                    "upload chunk failed: API error: {} (code: {})",
-                    parsed.msg, parsed.code
-                )));
-            }
-            let _ = tsfn.call(length as f64, ThreadsafeFunctionCallMode::NonBlocking);
-            return Ok(length as f64);
+        // V3 永远回 200，成败只看 body 里的 code。解析不出来不能退回按状态码判断——
+        // 那等于把任何非预期响应都当成上传成功，offset 会跳过服务端没存下的字节，
+        // 最后报 COMPLETED 却传出一个坏文件。宁可明确失败。
+        let parsed = serde_json::from_str::<V3ChunkUploadResponse>(&body).map_err(|_| {
+            napi::Error::from_reason(format!(
+                "upload chunk failed: unexpected V3 response ({}): {}",
+                status,
+                body.chars().take(200).collect::<String>()
+            ))
+        })?;
+        if parsed.code != 0 {
+            return Err(napi::Error::from_reason(format!(
+                "upload chunk failed: API error: {} (code: {})",
+                parsed.msg, parsed.code
+            )));
         }
+        let _ = tsfn.call(length as f64, ThreadsafeFunctionCallMode::NonBlocking);
+        return Ok(length as f64);
     }
 
     if !status.is_success() {
