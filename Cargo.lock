@@ -88,9 +88,9 @@ dependencies = [
 
 [[package]]
 name = "cloudreve-api"
-version = "0.8.4"
+version = "0.9.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a7fef7dd5e584ae5f6231b2c50daaa861b61f80fb61f586d007ca1e2add15162"
+checksum = "0c835eb3ad835f3cd98d1f7f97d6d49112578bd935b28d904896c5c4b88e18b5"
 dependencies = [
  "chrono",
  "futures",

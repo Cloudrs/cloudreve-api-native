@@ -918,11 +918,26 @@ pub async fn get_user_storage() -> napi::Result<String> {
 pub async fn get_user_setting() -> napi::Result<String> {
     let api = get_client()?;
     if let Some(v3) = api.inner().as_v3() {
-        let info = v3
+        // 早先 crate 把 /user/setting 解成 /user/storage 的 StorageInfo，
+        // 每次进「我的」页都稳定报 missing field `used`。现在类型对了，
+        // 这里统一映射成和下面 V4 分支一样的形状，ETS 侧只认这一种。
+        let setting = v3
             .get_user_settings()
             .await
             .map_err(|e| napi::Error::from_reason(e.to_string()))?;
-        serde_json::to_string(&info).map_err(|e| napi::Error::from_reason(e.to_string()))
+        let mapped = ApiUserSetting {
+            uid: setting.uid,
+            authn: setting
+                .authn
+                .iter()
+                .map(|credential| credential.id.clone())
+                .collect(),
+            homepage: setting.homepage,
+            prefer_theme: setting.prefer_theme,
+            themes: setting.themes,
+            two_factor: setting.two_factor,
+        };
+        serde_json::to_string(&mapped).map_err(|e| napi::Error::from_reason(e.to_string()))
     } else {
         let v4 = api.inner().as_v4()
             .ok_or_else(|| napi::Error::from_reason("not a v4 client"))?;
